@@ -1,4 +1,4 @@
-# GEP: water use
+# GEP: Domestic Water Supply
 
 **Objective:** Estimate the annual replacement cost of municipal raw-water provisioning for urban centres worldwide. The analysis compares the least-cost modeled supply portfolio for each city with the least-cost feasible portfolio available after the selected sources and their recorded shared-flow alternatives are removed.
 
