@@ -1,0 +1,640 @@
+---
+title: "Shortlist surface-water candidates and record shared flow paths"
+---
+
+Run this file after `4_1_identify_sw_source.qmd`. It reads the broad candidate file and saves a smaller file for the elevation and cost steps. It also saves pairs of alternatives that must not both be built for the same city under the current shared-flow assumption. 
+
+A RiverATLAS `HYRIV_ID` identifies a reach, and `NEXT_DOWN` identifies its next reach downstream. We index this network **once**. After that, checking whether two reaches are on the same flow path takes a few integer comparisons; there is no downstream walk for each city candidate. Separate tributaries can both be retained. An on-stream lake uses `HYRIV_RCH`. An off-stream lake uses `HYRIV_CAT` as an approximate receiving reach. A lake with neither link remains available, with its unknown network relationship flagged.
+
+The broad `4_1` candidate file must screen rivers by mean annual flow only.  This shortlist selects two river pools from that same file. The first retains up to 30 distinct-path reaches ranked by proximity and up to 30 ranked by mean annual naturalized flow. The second uses reaches whose average lowest-month flow is at least 0.5 m3/s, retaining up to 30 ranked by proximity and up to 30 ranked by lowest-month flow. These four lists are combined by city and reach ID. The low-month criterion adds candidates; it does not remove any reach from the first pool or change step 6 capacity.
+
+Competing reaches on the same path can appear in the combined shortlist.  Their conflicts, including conflicts between the two pools, are computed after the union. Lake candidates are unchanged. No previously chosen reach IDs or optimization results enter selection. This remains a computational approximation: a useful reach can fall outside all four lists.
+
+## Read the broad candidate file and RiverATLAS links
+
+```{r}
+#| label: setup
+
+library(data.table)
+library(sf)
+library(here)
+library(Rcpp)
+
+candidate_file <- here(
+  "Data/Processed/1_surface_water_candidates.rds"
+)
+shortlist_file <- here(
+  "Data/Processed/1_surface_water_candidates_shortlist.rds"
+)
+analysis_dir <- here("Data/Analysis")
+dir.create(analysis_dir, recursive = TRUE, showWarnings = FALSE)
+
+n_mean_nearest <- 30L
+n_mean_highflow <- 30L
+n_low_nearest <- 30L
+n_low_highflow <- 30L
+min_lowmonth_flow_for_shortlist_m3s <- 0.5
+
+all_candidates <- as.data.table(readRDS(candidate_file))
+stopifnot(
+  all(c(
+    "urban_id", "source_type", "source_id", "distance_km",
+    "source_discharge_m3s", "source_lowflow_m3s"
+  ) %in% names(all_candidates)),
+  all(all_candidates$source_type %in% c("river", "lake")),
+  !anyDuplicated(
+    all_candidates[, .(urban_id, source_type, source_id)]
+  )
+)
+
+rivers <- copy(all_candidates[source_type == "river"])
+lakes <- copy(all_candidates[source_type == "lake"])
+rm(all_candidates)
+
+gc()
+
+stopifnot(
+  nrow(rivers) > 0L,
+  all(is.finite(rivers$distance_km)),
+  all(is.finite(rivers$source_discharge_m3s))
+)
+
+river_gdb <- here("Data/Raw/RiverATLAS/RiverATLAS_v10.gdb")
+river_layer <- st_layers(river_gdb)$name
+stopifnot(length(river_layer) == 1L)
+
+river_links <- st_read(
+  river_gdb,
+  query = paste0(
+    'SELECT HYRIV_ID, NEXT_DOWN FROM "',
+    river_layer,
+    '"'
+  ),
+  quiet = TRUE
+)
+if (inherits(river_links, "sf")) {
+  river_links <- st_drop_geometry(river_links)
+}
+river_links <- as.data.table(river_links)
+stopifnot(
+  all(c("HYRIV_ID", "NEXT_DOWN") %in% names(river_links)),
+  !anyDuplicated(river_links$HYRIV_ID)
+)
+
+reach_id <- as.integer(river_links$HYRIV_ID)
+next_down <- as.integer(river_links$NEXT_DOWN)
+stopifnot(!anyNA(reach_id), !anyNA(next_down))
+```
+
+## Build a river-network index once
+
+Each reach receives an entry position (`tin`), exit position (`tout`), and outlet group (`root`). A downstream reach contains an upstream reach's interval. Reaches on separate tributaries do not contain one another.  The helper functions below run the large network and city comparisons in compiled C++; the data preparation and outputs remain in R.
+
+```{r}
+#| label: build-river-network-index
+
+rcpp_code <- '
+#include <Rcpp.h>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+using namespace Rcpp;
+
+// [[Rcpp::plugins(cpp11)]]
+
+// [[Rcpp::export]]
+List index_river_network(IntegerVector id, IntegerVector down) {
+  int n = id.size();
+  if (down.size() != n) stop("River link columns have different lengths");
+
+  std::unordered_map<int, int> position;
+  position.reserve((size_t)n * 2);
+  for (int i = 0; i < n; ++i) {
+    if (!position.emplace(id[i], i).second) stop("Duplicate reach ID");
+  }
+
+  std::vector<int> parent(n, -1), first_child(n, -1), sibling(n, -1);
+  for (int i = 0; i < n; ++i) {
+    if (down[i] <= 0) continue;
+    auto found = position.find(down[i]);
+    if (found == position.end()) stop("NEXT_DOWN reach is missing");
+    parent[i] = found->second;
+    sibling[i] = first_child[parent[i]];
+    first_child[parent[i]] = i;
+  }
+
+  IntegerVector tin(n), tout(n), root(n);
+  std::vector<int> node_stack, exit_stack;
+  int timer = 0;
+  for (int outlet = 0; outlet < n; ++outlet) {
+    if (parent[outlet] != -1) continue;
+    node_stack.push_back(outlet);
+    exit_stack.push_back(0);
+    while (!node_stack.empty()) {
+      int at = node_stack.back();
+      int exiting = exit_stack.back();
+      node_stack.pop_back();
+      exit_stack.pop_back();
+      if (exiting) {
+        tout[at] = timer;
+        continue;
+      }
+      tin[at] = ++timer;
+      root[at] = outlet + 1;
+      node_stack.push_back(at);
+      exit_stack.push_back(1);
+      for (int child = first_child[at]; child != -1;
+           child = sibling[child]) {
+        node_stack.push_back(child);
+        exit_stack.push_back(0);
+      }
+    }
+  }
+  if (timer != n) stop("River network has a cycle or unreachable reach");
+  return List::create(_["tin"] = tin, _["tout"] = tout,
+                      _["root"] = root);
+}
+
+bool same_path(int a, int b, IntegerVector tin,
+               IntegerVector tout, IntegerVector root) {
+  return root[a] > 0 && root[a] == root[b] &&
+    ((tin[a] <= tin[b] && tout[b] <= tout[a]) ||
+     (tin[b] <= tin[a] && tout[a] <= tout[b]));
+}
+
+// [[Rcpp::export]]
+IntegerMatrix river_path_pairs(IntegerVector tin, IntegerVector tout,
+                               IntegerVector root) {
+  int n = tin.size();
+  if (tout.size() != n || root.size() != n)
+    stop("River path columns have different lengths");
+  std::vector<int> left, right;
+  for (int a = 0; a < n; ++a) {
+    for (int b = a + 1; b < n; ++b) {
+      if (same_path(a, b, tin, tout, root)) {
+        left.push_back(a + 1);
+        right.push_back(b + 1);
+      }
+    }
+  }
+  IntegerMatrix pairs(left.size(), 2);
+  for (size_t i = 0; i < left.size(); ++i) {
+    pairs(i, 0) = left[i];
+    pairs(i, 1) = right[i];
+  }
+  return pairs;
+}
+
+// [[Rcpp::export]]
+List shortlist_city(IntegerVector id, NumericVector distance,
+                    NumericVector flow, IntegerVector tin,
+                    IntegerVector tout, IntegerVector root,
+                    int n_nearest, int n_highflow) {
+  int n = id.size();
+  std::vector<int> by_near(n), by_flow(n);
+  std::iota(by_near.begin(), by_near.end(), 0);
+  std::iota(by_flow.begin(), by_flow.end(), 0);
+  std::sort(by_near.begin(), by_near.end(), [&](int a, int b) {
+    if (distance[a] != distance[b]) return distance[a] < distance[b];
+    if (flow[a] != flow[b]) return flow[a] > flow[b];
+    return id[a] < id[b];
+  });
+  std::sort(by_flow.begin(), by_flow.end(), [&](int a, int b) {
+    if (flow[a] != flow[b]) return flow[a] > flow[b];
+    if (distance[a] != distance[b]) return distance[a] < distance[b];
+    return id[a] < id[b];
+  });
+
+  auto select = [&](const std::vector<int>& ranking, int limit) {
+    std::vector<int> selected;
+    for (int candidate : ranking) {
+      bool overlaps = false;
+      for (int chosen : selected) {
+        if (same_path(candidate, chosen, tin, tout, root)) {
+          overlaps = true;
+          break;
+        }
+      }
+      if (!overlaps) selected.push_back(candidate);
+      if ((int)selected.size() >= limit) break;
+    }
+    return selected;
+  };
+
+  std::vector<int> chosen = select(by_near, n_nearest);
+  std::vector<int> high = select(by_flow, n_highflow);
+  chosen.insert(chosen.end(), high.begin(), high.end());
+  std::sort(chosen.begin(), chosen.end());
+  chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
+
+  IntegerVector rows(chosen.size());
+  std::vector<int> left, right;
+  for (size_t a = 0; a < chosen.size(); ++a) {
+    rows[a] = chosen[a] + 1;
+    for (size_t b = a + 1; b < chosen.size(); ++b) {
+      if (same_path(chosen[a], chosen[b], tin, tout, root)) {
+        left.push_back(a + 1);
+        right.push_back(b + 1);
+      }
+    }
+  }
+  IntegerMatrix pairs(left.size(), 2);
+  for (size_t i = 0; i < left.size(); ++i) {
+    pairs(i, 0) = left[i];
+    pairs(i, 1) = right[i];
+  }
+  return List::create(_["rows"] = rows, _["pairs"] = pairs);
+}
+
+// [[Rcpp::export]]
+IntegerMatrix lake_path_pairs(IntegerVector tin, IntegerVector tout,
+                              IntegerVector root, IntegerVector kind) {
+  int n = tin.size();
+  std::vector<int> left, right;
+  for (int a = 0; a < n; ++a) {
+    if (root[a] == NA_INTEGER) continue;
+    for (int b = a + 1; b < n; ++b) {
+      if (root[b] == NA_INTEGER) continue;
+      if (kind[a] == 0 && kind[b] == 0) continue;
+
+      // 0 = river, 1 = on-stream lake, 2 = off-stream lake.
+      // Two off-stream lakes are not necessarily linked merely because
+      // their pour points lie in the same reach catchment.
+      if (kind[a] == 2 && kind[b] == 2) continue;
+      bool conflict = false;
+      if (kind[a] == 2) {
+        // Source b must be on the receiving reach or downstream.
+        conflict = root[a] == root[b] &&
+          tin[b] <= tin[a] && tout[a] <= tout[b];
+      } else if (kind[b] == 2) {
+        conflict = root[a] == root[b] &&
+          tin[a] <= tin[b] && tout[b] <= tout[a];
+      } else {
+        conflict = same_path(a, b, tin, tout, root);
+      }
+      if (conflict) {
+        left.push_back(a + 1);
+        right.push_back(b + 1);
+      }
+    }
+  }
+  IntegerMatrix pairs(left.size(), 2);
+  for (size_t i = 0; i < left.size(); ++i) {
+    pairs(i, 0) = left[i];
+    pairs(i, 1) = right[i];
+  }
+  return pairs;
+}
+'
+
+Rcpp::sourceCpp(code = rcpp_code, verbose = FALSE)
+
+# A branching example: reaches 2 and 3 are tributaries; 4 flows into 2.
+toy <- index_river_network(
+  c(1L, 2L, 3L, 4L),
+  c(0L, 1L, 1L, 2L)
+)
+toy_choice <- shortlist_city(
+  c(1L, 2L, 3L, 4L),
+  c(20, 10, 11, 9),
+  c(100, 20, 15, 5),
+  toy$tin, toy$tout, toy$root,
+  2L, 1L
+)
+stopifnot(
+  identical(as.integer(toy_choice$rows), c(1L, 3L, 4L)),
+  nrow(toy_choice$pairs) == 2L,
+  nrow(river_path_pairs(toy$tin, toy$tout, toy$root)) == 4L
+)
+toy_lake_pairs <- lake_path_pairs(
+  toy$tin[c(4L, 3L, 2L)],
+  toy$tout[c(4L, 3L, 2L)],
+  toy$root[c(4L, 3L, 2L)],
+  c(0L, 0L, 1L)
+)
+stopifnot(
+  nrow(toy_lake_pairs) == 1L,
+  identical(as.integer(toy_lake_pairs[1L, ]), c(1L, 3L))
+)
+toy_offstream_pairs <- lake_path_pairs(
+  toy$tin[c(2L, 1L, 4L, 3L)],
+  toy$tout[c(2L, 1L, 4L, 3L)],
+  toy$root[c(2L, 1L, 4L, 3L)],
+  c(2L, 0L, 0L, 0L)
+)
+stopifnot(
+  nrow(toy_offstream_pairs) == 1L,
+  identical(as.integer(toy_offstream_pairs[1L, ]), c(1L, 2L)),
+  nrow(lake_path_pairs(
+    toy$tin[c(2L, 2L)],
+    toy$tout[c(2L, 2L)],
+    toy$root[c(2L, 2L)],
+    c(2L, 2L)
+  )) == 0L
+)
+
+network_index <- index_river_network(reach_id, next_down)
+river_links[, `:=`(
+  tin = network_index$tin,
+  tout = network_index$tout,
+  root = network_index$root
+)]
+rm(network_index)
+
+rivers[, reach_id := suppressWarnings(as.integer(source_id))]
+stopifnot(!anyNA(rivers$reach_id))
+river_position <- match(rivers$reach_id, reach_id)
+if (anyNA(river_position)) {
+  stop("Some candidate river reaches are missing from RiverATLAS")
+}
+rivers[, `:=`(
+  tin = river_links$tin[river_position],
+  tout = river_links$tout[river_position],
+  root = river_links$root[river_position]
+)]
+rm(river_position)
+```
+
+## Shortlist rivers and retain their conflicts
+
+These compiled comparisons have no per-reach downstream walk. The messages below report actual progress; there is no extrapolated 100-city runtime.
+
+```{r}
+#| label: shortlist-rivers
+
+setkey(rivers, urban_id)
+city_ids <- unique(rivers$urban_id)
+shortlist_parts <- vector("list", length(city_ids))
+river_conflict_parts <- vector("list", length(city_ids))
+mean_counts <- integer(length(city_ids))
+low_counts <- integer(length(city_ids))
+additional_counts <- integer(length(city_ids))
+
+for (i in seq_along(city_ids)) {
+  city <- rivers[.(city_ids[i])]
+
+  # Mean-annual pool: all broad river candidates are eligible.
+  mean_choice <- shortlist_city(
+    city$reach_id,
+    city$distance_km,
+    city$source_discharge_m3s,
+    city$tin,
+    city$tout,
+    city$root,
+    n_mean_nearest,
+    n_mean_highflow
+  )
+
+  # Low-month pool: this condition adds alternatives without screening
+  # the mean-annual pool. Keep indices relative to the original city table.
+  eligible_low <- which(
+    is.finite(city$source_lowflow_m3s) &
+      city$source_lowflow_m3s >= min_lowmonth_flow_for_shortlist_m3s
+  )
+  low_rows <- integer()
+
+  if (length(eligible_low)) {
+    low_city <- city[eligible_low]
+    low_choice <- shortlist_city(
+      low_city$reach_id,
+      low_city$distance_km,
+      low_city$source_lowflow_m3s,
+      low_city$tin,
+      low_city$tout,
+      low_city$root,
+      n_low_nearest,
+      n_low_highflow
+    )
+    low_rows <- eligible_low[low_choice$rows]
+  }
+
+  selected_rows <- sort(unique(c(mean_choice$rows, low_rows)))
+  selected <- city[selected_rows]
+  shortlist_parts[[i]] <- selected
+
+  mean_counts[i] <- length(mean_choice$rows)
+  low_counts[i] <- length(low_rows)
+  additional_counts[i] <- length(setdiff(low_rows, mean_choice$rows))
+
+  # Recompute on the union: each original pass knows nothing about the
+  # other pass's selected reaches.
+  pairs <- river_path_pairs(
+    selected$tin,
+    selected$tout,
+    selected$root
+  )
+  if (nrow(pairs)) {
+    a <- paste0("river:", selected$source_id[pairs[, 1L]])
+    b <- paste0("river:", selected$source_id[pairs[, 2L]])
+    river_conflict_parts[[i]] <- data.table(
+      urban_id = city_ids[i],
+      source_key_a = pmin(a, b),
+      source_key_b = pmax(a, b)
+    )
+  }
+  if (i %% 500L == 0L || i == length(city_ids)) {
+    message("Rivers: ", i, " / ", length(city_ids), " cities")
+  }
+}
+
+river_shortlist <- rbindlist(shortlist_parts, use.names = TRUE)
+river_conflicts <- rbindlist(river_conflict_parts, fill = TRUE)
+rm(shortlist_parts, river_conflict_parts, rivers)
+gc()
+
+selection_summary <- data.table(
+  urban_id = city_ids,
+  mean_pool_n = mean_counts,
+  low_month_pool_n = low_counts,
+  added_by_low_month_n = additional_counts,
+  union_n = mean_counts + additional_counts
+)
+fwrite(
+  selection_summary,
+  file.path(analysis_dir, "surface_water_shortlist_selection_summary.csv")
+)
+print(selection_summary[, .(
+  cities = .N,
+  rivers_from_mean_pool = sum(mean_pool_n),
+  additional_rivers_from_low_month_pool = sum(added_by_low_month_n),
+  maximum_rivers_per_city = max(union_n)
+)])
+
+river_shortlist[, candidate_rank := frank(distance_km, ties.method = "first"),
+                by = urban_id]
+river_network <- river_shortlist[, .(
+  urban_id,
+  source_type,
+  source_key = paste0("river:", source_id),
+  tin,
+  tout,
+  root,
+  match_type = "river_reach"
+)]
+river_shortlist[, c("reach_id", "tin", "tout", "root") := NULL]
+
+stopifnot(
+  !anyDuplicated(river_shortlist[, .(urban_id, source_id)]),
+  river_shortlist[, max(.N), by = urban_id][, max(V1)] <=
+    n_mean_nearest + n_mean_highflow +
+      n_low_nearest + n_low_highflow
+)
+```
+
+## Match lakes to river reaches and reach catchments
+
+`HYRIV_RCH` identifies an on-stream lake. For an off-stream lake, `HYRIV_CAT` identifies the reach catchment containing its outlet. We treat that reach as an approximate receiving point: the lake may overlap with a river intake there or farther downstream, but the catchment ID alone does not show that it overlaps with upstream sources or other off-stream lakes. Lakes with neither link are flagged; no network conflict is inferred for them.
+
+```{r}
+#| label: match-lakes-to-river-reaches
+
+lake_gdb <- here("Data/raw/LakeATLAS/LakeATLAS_v10.gdb")
+lake_layer <- "LakeATLAS_v10_pol"
+stopifnot(lake_layer %in% st_layers(lake_gdb)$name)
+
+lake_links <- st_read(
+  lake_gdb,
+  query = paste0(
+    'SELECT Hylak_id, HYRIV_RCH, HYRIV_CAT FROM "',
+    lake_layer,
+    '"'
+  ),
+  quiet = TRUE
+)
+if (inherits(lake_links, "sf")) {
+  lake_links <- st_drop_geometry(lake_links)
+}
+lake_links <- as.data.table(lake_links)
+stopifnot(
+  all(c("Hylak_id", "HYRIV_RCH", "HYRIV_CAT") %in%
+      names(lake_links)),
+  !anyDuplicated(lake_links$Hylak_id)
+)
+
+lake_id <- suppressWarnings(as.integer(lakes$source_id))
+stopifnot(!anyNA(lake_id))
+lake_position <- match(lake_id, lake_links$Hylak_id)
+on_reach <- as.integer(lake_links$HYRIV_RCH[lake_position])
+in_catchment <- as.integer(lake_links$HYRIV_CAT[lake_position])
+
+has_on_reach <- !is.na(on_reach) & on_reach > 0L
+has_catchment <- !has_on_reach &
+  !is.na(in_catchment) & in_catchment > 0L
+
+link_reach_id <- rep(NA_integer_, length(lake_id))
+link_reach_id[has_on_reach] <- on_reach[has_on_reach]
+link_reach_id[has_catchment] <- in_catchment[has_catchment]
+link_position <- match(link_reach_id, reach_id)
+
+lake_match_type <- rep("unmapped_lake", length(lake_id))
+lake_match_type[has_on_reach & !is.na(link_position)] <-
+  "lake_on_reach"
+lake_match_type[has_catchment & !is.na(link_position)] <-
+  "lake_in_reach_catchment"
+
+lake_network <- data.table(
+  urban_id = lakes$urban_id,
+  source_type = "lake",
+  source_key = paste0("lake:", lakes$source_id),
+  link_reach_id = link_reach_id,
+  tin = river_links$tin[link_position],
+  tout = river_links$tout[link_position],
+  root = river_links$root[link_position],
+  match_type = lake_match_type
+)
+
+river_network[, link_reach_id := as.integer(
+  sub("^river:", "", source_key)
+)]
+network_options <- rbindlist(
+  list(river_network, lake_network),
+  use.names = TRUE
+)
+network_options[, node_kind := match(
+  match_type,
+  c(
+    "river_reach",
+    "lake_on_reach",
+    "lake_in_reach_catchment",
+    "unmapped_lake"
+  )
+) - 1L]
+stopifnot(!anyNA(network_options$node_kind))
+setkey(network_options, urban_id)
+lake_city_ids <- unique(lake_network$urban_id)
+lake_conflict_parts <- vector("list", length(lake_city_ids))
+
+for (i in seq_along(lake_city_ids)) {
+  city <- network_options[.(lake_city_ids[i])]
+  pairs <- lake_path_pairs(
+    city$tin,
+    city$tout,
+    city$root,
+    city$node_kind
+  )
+  if (nrow(pairs)) {
+    a <- city$source_key[pairs[, 1L]]
+    b <- city$source_key[pairs[, 2L]]
+    lake_conflict_parts[[i]] <- data.table(
+      urban_id = lake_city_ids[i],
+      source_key_a = pmin(a, b),
+      source_key_b = pmax(a, b)
+    )
+  }
+  if (i %% 500L == 0L || i == length(lake_city_ids)) {
+    message("Lakes: ", i, " / ", length(lake_city_ids), " cities")
+  }
+}
+
+conflicts <- unique(rbindlist(
+  c(list(river_conflicts), lake_conflict_parts),
+  fill = TRUE
+))
+if (is.null(conflicts) || !nrow(conflicts)) {
+  conflicts <- data.table(
+    urban_id = integer(),
+    source_key_a = character(),
+    source_key_b = character()
+  )
+}
+stopifnot(
+  !anyDuplicated(conflicts),
+  all(conflicts$source_key_a != conflicts$source_key_b)
+)
+
+shortlist <- rbindlist(
+  list(river_shortlist, lakes),
+  use.names = TRUE,
+  fill = TRUE
+)
+stopifnot(
+  !anyDuplicated(shortlist[, .(urban_id, source_type, source_id)]),
+  nrow(shortlist[source_type == "lake"]) == nrow(lakes)
+)
+
+saveRDS(shortlist, shortlist_file)
+saveRDS(
+  conflicts,
+  file.path(analysis_dir, "surface_water_conflicts.rds")
+)
+fwrite(
+  network_options[, .(
+    urban_id, source_key, source_type, link_reach_id, match_type
+  )],
+  file.path(analysis_dir, "surface_water_network_matches.csv")
+)
+
+print(shortlist[, .N, by = source_type])
+print(river_shortlist[, .N, by = urban_id][, summary(N)])
+print(data.table(
+  conflict_pairs = nrow(conflicts),
+  on_reach_lakes = lake_network[match_type == "lake_on_reach", .N],
+  offstream_lakes = lake_network[
+    match_type == "lake_in_reach_catchment", .N
+  ],
+  unmapped_lakes = lake_network[match_type == "unmapped_lake", .N]
+))
+```
+
+Use `Data/Processed/1_surface_water_candidates_shortlist.rds` for the subsequent elevation step and `Data/Analysis/surface_water_conflicts.rds` for the later city optimizer. Its former `x_surface_water_conflicts.rds` input must be changed to the new intermediate filename. The separate `6_2` overlap file is no longer needed. Existing elevations can be reused only when their source coordinates are verified to match the shortlisted points.

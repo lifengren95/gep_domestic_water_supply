@@ -1,0 +1,235 @@
+---
+title: "Get energy cost from World Bank"
+---
+
+
+```{r}
+library(countrycode)
+library(jsonlite)
+
+# /*===========================================*/
+#'=  1. Download World Bank electricity price =
+# /*===========================================*/
+
+wb_indicator <- "IC.ELC.PRI.KH.DB1619"
+wb_year <- 2019L
+
+wb_url <- paste0(
+  "https://api.worldbank.org/v2/country/all/indicator/",
+  wb_indicator,
+  "?date=", wb_year,
+  "&source=1",
+  "&format=json",
+  "&per_page=500"
+)
+
+wb_raw <- fromJSON(
+  wb_url,
+  flatten = TRUE
+)
+
+stopifnot(
+  length(wb_raw) >= 2L,
+  !is.null(wb_raw[[2]])
+)
+
+wb_electricity_raw <- as.data.table(
+  wb_raw[[2]]
+)
+
+
+# /*===========================================*/
+#'=  2. Clean electricity-price data =
+# /*===========================================*/
+
+wb_electricity_2019 <- wb_electricity_raw[
+  !is.na(value) &
+    nzchar(countryiso3code),
+  .(
+    wb_id = country.id,
+    iso3 = countryiso3code,
+    wb_country_name = country.value,
+    year = as.integer(date),
+    electricity_price_2019uscents_kwh =
+      as.numeric(value)
+  )
+]
+
+wb_electricity_2019[, electricity_price_2019usd_kwh :=
+  electricity_price_2019uscents_kwh / 100]
+
+
+# /*===========================================*/
+#'=  3. Remove subnational Doing Business rows =
+# /*===========================================*/
+
+subnational_cities <- c(
+  "Beijing",
+  "Shanghai",
+  "Chittagong",
+  "Dhaka",
+  "Delhi",
+  "Mumbai",
+  "Jakarta",
+  "Surabaya",
+  "Kano",
+  "Lagos",
+  "Karachi",
+  "Lahore",
+  "Los Angeles",
+  "New York",
+  "Mexico City",
+  "Monterrey",
+  "Moscow",
+  "St. Petersburg",
+  "Osaka",
+  "Tokyo",
+  "Rio de Janeiro",
+  "Sao Paulo"
+)
+
+wb_electricity_2019 <- wb_electricity_2019[
+  !wb_country_name %chin% subnational_cities
+]
+
+#/*--------------------------------*/
+#' ## Validate
+#/*--------------------------------*/
+stopifnot(
+  wb_electricity_2019[
+    !is.finite(electricity_price_2019usd_kwh) |
+      electricity_price_2019usd_kwh <= 0,
+    .N
+  ] == 0L
+)
+
+stopifnot(
+  wb_electricity_2019[
+    ,
+    .N,
+    by = iso3
+  ][N > 1L, .N] == 0L
+)
+
+wb_electricity_2019[
+  ,
+  .N,
+  by = iso3
+][N > 1L]
+
+
+# /*===========================================*/
+#'=  3. Convert urban-center country ID to ISO3 =
+# /*===========================================*/
+uc_2025 <- readRDS(here("Data/Processed/ghsl_urban_centres_2025.rds"))
+
+uc_2025[, iso3 :=
+  countrycode(
+    country_id,
+    origin = "un",
+    destination = "iso3c"
+  )]
+
+# Special statistical codes
+uc_2025[country_id == 158, iso3 := "TWN"]
+uc_2025[country_id == 412, iso3 := "XKX"]
+
+uc_2025[
+  is.na(iso3),
+  unique(.(
+    country_id,
+    country_name
+  ))
+]
+
+wb_electricity_2019[
+  iso3 %in% c("TWN", "XKX"),
+  .(
+    iso3,
+    wb_country_name,
+    electricity_price_2019uscents_kwh,
+    electricity_price_2019usd_kwh
+  )
+]
+
+# /*===========================================*/
+#'=  4. Attach electricity price to urban centers =
+# /*===========================================*/
+
+uc_2025[
+  wb_electricity_2019[, .(
+    iso3,
+    electricity_price_2019uscents_kwh,
+    electricity_price_2019usd_kwh
+  )],
+  on = "iso3",
+  `:=`(
+    electricity_price_2019uscents_kwh =
+      i.electricity_price_2019uscents_kwh,
+    electricity_price_2019usd_kwh =
+      i.electricity_price_2019usd_kwh
+  )]
+
+
+# Inspect missing countries
+missing_electricity_price <- uc_2025[
+  is.na(electricity_price_2019usd_kwh),
+  .(
+    n_urban_centers = .N,
+    population = sum(population, na.rm = TRUE)
+  ),
+  by = .(
+    country_id,
+    country_name,
+    iso3
+  )
+][order(-population)]
+
+missing_electricity_price
+
+# Overall coverage
+uc_2025[, .(
+  n_urban_centers = .N,
+  n_with_price =
+    sum(!is.na(electricity_price_2019usd_kwh)),
+  n_without_price =
+    sum(is.na(electricity_price_2019usd_kwh)),
+  share_with_price =
+    mean(!is.na(electricity_price_2019usd_kwh))
+)]
+
+# /*===========================================*/
+#'=  Save urban centers with electricity price =
+# /*===========================================*/
+saveRDS(
+  wb_electricity_2019,
+  here("Data/Processed/world_bank_electricity_price_2019.rds")
+)
+
+saveRDS(
+  uc_2025,
+  here("Data/Processed/uc_2025_with_electricity_price.rds")
+)
+```
+
+
+```{r}
+# rds to csv
+wb_electricity_2019 <- readRDS(here("Data/Processed/world_bank_electricity_price_2019.rds"))
+
+uc_2025 <- readRDS(here("Data/Processed/uc_2025_with_electricity_price.rds"))
+
+
+write.csv(
+  wb_electricity_2019,
+  here("Data/Processed/world_bank_electricity_price_2019.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  uc_2025,
+  here("Data/Processed/uc_2025_with_electricity_price.csv"),
+  row.names = FALSE
+)
+
+```

@@ -1,0 +1,107 @@
+---
+title: "Estimate demand for 2025 urban centers using 2019 country-level withdrawal rates"
+---
+
+# Objective
+
++ Calculate the municipal water demand for each population center using AQUASTAT municipal water withdrawal per capita (total population) data.
+
+
+```{r}
+#/*--------------------------------*/
+#' ## Load AQUASTAT municipal withdrawal data 
+#/*--------------------------------*/
+aquastat_muni_raw <- fread(
+  "Data/raw/AQUASTAT/AQUASTAT_muni_withdrawal_per_capita.csv"
+)
+
+# Check indicator
+unique(aquastat_muni_raw$Variable)
+unique(aquastat_muni_raw$Unit) # m3/inhab/yr
+
+
+# --- Select the most recent observation for each country --- #
+aquastat_muni <- 
+  aquastat_muni_raw[
+    Year == 2019 &
+    Variable == "Municipal water withdrawal per capita (total population)" &
+      IsAggregate == FALSE
+  ][
+    ,
+    .(
+      country_id = m49,
+      aquastat_year = Year,
+      muni_pc_m3yr = Value,
+      aquastat_flag = Symbol
+    )
+  ]
+
+
+#/*--------------------------------*/
+#' ## Merge AQUASTAT rates with GHSL urban centers
+#/*--------------------------------*/
+uc_2025 <- readRDS(here("Data/Processed/ghsl_urban_centres_2025.rds"))
+
+uc_2025 <- 
+  merge(
+    uc_2025,
+    aquastat_muni,
+    by = "country_id",
+    all.x = TRUE
+  )
+
+# Check how many urban centers recieved an AQUASTAT value:
+uc_2025[
+  ,
+  .(
+    n_urban_centres = .N,
+    n_with_aquastat = sum(!is.na(muni_pc_m3yr)),
+    n_missing = sum(is.na(muni_pc_m3yr))
+  )
+]
+
+# Inspect countries with missing AQUASTAT data
+uc_2025[
+  is.na(muni_pc_m3yr),
+  .N,
+  by = country_name
+][
+  order(-N)
+]
+
+
+#/*--------------------------------*/
+#' ## Calculate municipal water demand
+#/*--------------------------------*/
+# Estimate municipal withdrawal for each urban center
+
+uc_2025[
+  # Estimated total annual municipal water withdrawal for urban centre i, in m3/year.
+  , muni_withdrawal_screen_m3yr := population * muni_pc_m3yr,
+  ][
+    # Average withdrawal flow rate, in m3/s.
+    , muni_withdrawal_screen_m3s := muni_withdrawal_screen_m3yr / (365.25 * 24 * 60 * 60)
+  ]
+
+# Check
+uc_2025[
+  order(-muni_withdrawal_screen_m3s),
+  .(
+    urban_name,
+    country_name,
+    population,
+    muni_pc_m3yr,
+    muni_withdrawal_screen_m3s
+  )
+][1:20]
+```
+
+
+
+```{r}
+# === Save === #
+fwrite(
+  uc_2025,
+  "Data/Analysis/ghsl_urban_centres_2019_with_muni_demand.csv"
+)
+```

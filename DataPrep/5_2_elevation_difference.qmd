@@ -1,0 +1,178 @@
+---
+title: "Calculate the source-to-city elevation difference"
+---
+
+# Inputs
+
+- Urban centers: `Data/Processed/ghsl_urban_centres_2025.rds`
+- Shortlisted sources: `Data/Processed/1_surface_water_candidates_shortlist.rds`
+- Elevation points from `5_1_elevation_updated.qmd`:
+  `Data/Processed/FABDEM/elevation_points_complete.rds`
+
+
+```{r}
+#| label: load-inputs
+
+uc_2025 <- 
+  readRDS(
+    here("Data/Processed/ghsl_urban_centres_2025.rds")
+  )
+
+surface_water_candidates <- 
+  readRDS(
+    here("Data/Processed/1_surface_water_candidates_shortlist.rds")
+  )
+```
+
+
+```{r}
+#| label: load-elevation-points
+elevation_points <-
+  readRDS(
+    here("Data/Processed/FABDEM/elevation_points_complete.rds")
+  )
+```
+
+
+```{r}
+#| label: attach-urban-elevation
+# /*===========================================*/
+#'=  Attach elevation to urban centers =
+# /*===========================================*/
+
+urban_elevation <- elevation_points[
+  point_type == "urban",
+  .(
+    lon,
+    lat,
+    urban_elevation_m = elevation_m,
+    urban_elevation_dataset = elevation_dataset
+  )
+]
+
+# Check uniqueness
+stopifnot(
+  urban_elevation[, .N, by = .(lon, lat)][N > 1L, .N] == 0L
+)
+
+uc_2025[
+  urban_elevation,
+  on = .(lon, lat),
+  `:=`(
+    urban_elevation_m = i.urban_elevation_m,
+    urban_elevation_dataset = i.urban_elevation_dataset
+  )
+]
+
+# Check
+stopifnot(
+  uc_2025[is.na(urban_elevation_m), .N] == 0L
+)
+
+
+# /*===========================================*/
+#'=  Attach elevation to surface-water source points =
+# /*===========================================*/
+
+source_elevation <- elevation_points[
+  point_type == "source",
+  .(
+    source_lon = lon,
+    source_lat = lat,
+    source_elevation_m = elevation_m,
+    source_elevation_dataset = elevation_dataset
+  )
+]
+
+# Check uniqueness
+stopifnot(
+  source_elevation[, .N, by = .(source_lon, source_lat)][N > 1L, .N] == 0L
+)
+
+# Join
+surface_water_candidates[
+  source_elevation,
+  on = .(source_lon, source_lat),
+  `:=`(
+    source_elevation_m = i.source_elevation_m,
+    source_elevation_dataset = i.source_elevation_dataset
+  )
+]
+
+# Check
+stopifnot(
+  surface_water_candidates[is.na(source_elevation_m), .N] == 0L
+)
+
+# /*===========================================*/
+#'=  Attach urban elevation to candidate rows =
+# /*===========================================*/
+surface_water_candidates[
+  uc_2025[, .(
+    urban_id,
+    urban_elevation_m,
+    urban_elevation_dataset
+  )],
+  on = "urban_id",
+  `:=`(
+    urban_elevation_m = i.urban_elevation_m,
+    urban_elevation_dataset = i.urban_elevation_dataset
+  )
+]
+
+stopifnot(
+  surface_water_candidates[
+    is.na(urban_elevation_m) |
+      is.na(source_elevation_m),
+    .N
+  ] == 0L
+)
+
+# /*===== Calculate the elevation difference =====*/
+surface_water_candidates[, delta_z_m := urban_elevation_m - source_elevation_m]
+
+summary(surface_water_candidates$delta_z_m)
+
+# Negative delta_z_m means the source is higher than the city.
+# Positive delta_z_m means lifting water to the city requires pumping.
+
+stopifnot(surface_water_candidates[!is.finite(delta_z_m), .N] == 0L)
+
+surface_water_candidates[, .(
+  min_delta_z_m = min(delta_z_m),
+  p25_delta_z_m = quantile(delta_z_m, 0.25),
+  median_delta_z_m = median(delta_z_m),
+  mean_delta_z_m = mean(delta_z_m),
+  p75_delta_z_m = quantile(delta_z_m, 0.75),
+  max_delta_z_m = max(delta_z_m)
+)]
+
+
+# /*===== Save =====*/
+saveRDS(
+  surface_water_candidates,
+  here("Data/Processed/2_surface_water_candidates_with_elevation.rds")
+)
+```
+
+The current step 4_2 combines four river rankings: up to 30 nearest and 30 highest mean-flow reaches, plus up to 30 nearest and 30 highest lowest-month-flow reaches among those passing its low-month criterion.  After deduplication, the output therefore contains at most 120 river reaches and 20 lakes or reservoirs per urban center. The actual counts are generally lower because the rankings can select the same reach.
+
+```{r}
+#| label: count-candidates-per-urban-center
+surface_water_candidates[, 
+  .(n_candidates = .N), 
+  by = .(urban_id, source_type)
+][,
+  summary(n_candidates),
+  by = source_type
+]
+
+# Count candidates per urban center and source type:
+surface_water_candidates[, 
+  .N,
+  by = .(urban_id, source_type)
+][,
+  .N,
+  by = .(source_type, n_candidates = N)
+][order(source_type, n_candidates)]
+```

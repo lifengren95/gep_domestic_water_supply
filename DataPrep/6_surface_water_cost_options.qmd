@@ -1,0 +1,404 @@
+---
+title: "City surface-water cost options"
+format: html
+execute:
+  echo: true
+---
+
+This step calculates a cost function for every shortlisted city–source pair.  It does not select a source or combine sources for a city. Run it after `5_2_elevation_difference.qmd`.
+
+For a selected source and pipe design, the annual cost of delivering $q$ cubic
+meters is
+
+$$
+C(q) = F + vq, \qquad 0 < q \leq \min(\text{pipe capacity},\ \text{source capacity}).
+$$
+
+Here $F$ is annualized construction plus maintenance, and $v$ is pumping electricity per cubic meter. A source that is not built costs zero. The later city optimization selects at most one design per source, can use multiple distinct sources, and applies `surface_water_conflicts.rds` there. This file does not read the conflict or network-matches files.
+
+The modeled source capacity is 30% of RiverATLAS/LakeATLAS mean annual naturalized flow, converted to an annual volume. This is an assumed annual withdrawal scenario, not an observed entitlement or a guaranteed dry-season yield. Step 4_1 screens the broad river candidates using mean annual flow.  Step 4_2 also uses lowest-month flow to add a complementary set of reaches to the shortlist; it does not remove mean-flow-selected reaches. Lowest-month flow is retained for audit but does not set capacity in this step. For a lake, mean outlet flow is used as a renewable-flow proxy. Reservoir storage is not converted to an annual yield because volume alone does not establish refill rates or operating rules.  Capacities are specified separately for each city and do not account for competition between cities.
+
+## 1. Set paths and assumptions
+
+```{r}
+candidate_file <- here(
+    "Data/Processed/2_surface_water_candidates_with_elevation.rds"
+  )
+
+price_file <- here(
+    "Data/Processed/uc_2025_with_electricity_price.rds"
+  )
+
+demand_file <- here(
+    "Data/Analysis/ghsl_urban_centres_2019_with_muni_demand.csv"
+  )
+
+output_file <- here(
+  "Data/Analysis/city_surface_water_capacity_options.csv"
+)
+
+input_files <- c(candidate_file, price_file, demand_file)
+if (!all(file.exists(input_files))) {
+  stop(
+    "Missing input file(s): ",
+    paste(input_files[!file.exists(input_files)], collapse = ", ")
+  )
+}
+
+seconds_per_year <- 365.25 * 24 * 60 * 60
+withdrawal_fraction <- 0.30
+design_shares <- c(0.25, 0.50, 0.75, 1.00)
+# Keep the available pipe designs identical in the 10% and 30% scenarios.
+# These are sizing references, not withdrawal permissions.
+reference_capacity_fractions <- c(0.10, 0.30)
+discount_rate <- 0.03
+
+stopifnot(
+  withdrawal_fraction > 0,
+  withdrawal_fraction <= 1,
+  all(design_shares > 0 & design_shares <= 1),
+  all(reference_capacity_fractions > 0 &
+        reference_capacity_fractions <= 1)
+)
+
+capital_recovery_factor <- function(rate, years) {
+  rate / (1 - (1 + rate)^(-years))
+}
+```
+
+## 2. Join city demand and electricity prices
+
+Use the demand file as the common demand input for both the source-cost and city-optimization steps. The earlier candidate file also carries a copy of the demand; check that the copies agree before replacing it.
+
+```{r}
+raw_candidates <- as.data.table(readRDS(candidate_file))
+
+required_candidates <- c(
+  "urban_id", "source_type", "source_id", "candidate_rank",
+  "distance_km", "delta_z_m", "source_discharge_m3s",
+  "source_lowflow_m3s", "muni_demand_m3s"
+)
+
+stopifnot(all(required_candidates %in% names(raw_candidates)))
+
+# Retain only the columns needed for the calculation. This avoids copying
+# elevation metadata and other wide columns for every pipe design.
+sw <- raw_candidates[, ..required_candidates]
+rm(raw_candidates)
+
+stopifnot(
+  !anyDuplicated(sw[, .(urban_id, source_type, source_id)]),
+  all(sw$source_type %in% c("river", "lake"))
+)
+
+demand <- fread(
+  demand_file,
+  select = c("urban_id", "muni_withdrawal_screen_m3s")
+)
+
+prices <- as.data.table(readRDS(price_file))
+stopifnot(all(
+  c("urban_id", "electricity_price_2019usd_kwh") %in% names(prices)
+))
+prices <- prices[, .(urban_id, electricity_price_2019usd_kwh)]
+
+stopifnot(
+  !anyDuplicated(demand$urban_id),
+  !anyDuplicated(prices$urban_id)
+)
+
+setnames(
+  demand,
+  "muni_withdrawal_screen_m3s",
+  "city_demand_m3s"
+)
+
+sw[demand, city_demand_m3s := i.city_demand_m3s, on = "urban_id"]
+
+has_both_demands <- is.finite(sw$muni_demand_m3s) &
+  is.finite(sw$city_demand_m3s)
+
+if (any(
+  abs(sw$muni_demand_m3s[has_both_demands] -
+        sw$city_demand_m3s[has_both_demands]) >
+    pmax(1e-10, 1e-7 * sw$city_demand_m3s[has_both_demands])
+)) {
+  stop("Demand in candidate and city-demand files does not agree")
+}
+
+sw[prices,
+  electricity_price_2019usd_kwh := i.electricity_price_2019usd_kwh,
+  on = "urban_id"
+]
+
+sw[, source_key := paste(source_type, source_id, sep = ":")]
+sw[, demand_m3_year := city_demand_m3s * seconds_per_year]
+sw[, source_capacity_m3_year :=
+  withdrawal_fraction * source_discharge_m3s * seconds_per_year
+]
+
+coverage <- sw[, .(
+  candidates = .N,
+  missing_city_demand = sum(!is.finite(city_demand_m3s)),
+  missing_electricity_price = sum(
+    !is.finite(electricity_price_2019usd_kwh)
+  ),
+  missing_or_nonpositive_mean_flow = sum(
+    !is.finite(source_discharge_m3s) | source_discharge_m3s <= 0
+  )
+), by = source_type]
+
+print(coverage)
+
+# A missing electricity price does not mean electricity is free. Exclude
+# unpriced options and preserve the coverage counts above for reporting.
+sw <- sw[
+  is.finite(demand_m3_year) & demand_m3_year > 0 &
+    is.finite(source_capacity_m3_year) &
+    source_capacity_m3_year > 0 &
+    is.finite(electricity_price_2019usd_kwh) &
+    electricity_price_2019usd_kwh >= 0 &
+    is.finite(distance_km) & distance_km >= 0 &
+    is.finite(delta_z_m)
+]
+
+if (nrow(sw) == 0L) {
+  stop("No candidates have demand, mean source flow, elevation, and price")
+}
+```
+
+## 3. Generate pipe-size options
+
+Four standard pipe capacities are fractions of the city's demand. Add two source-scaled capacities, based on 10% and 30% of the modeled mean annual flow.  Both sets of pipe designs are available under either withdrawal scenario.  Changing `withdrawal_fraction` changes how much a source may deliver, but not the available designs or the cost of a given design. This makes the 10% and 30% cost results comparable as a capacity sensitivity.
+
+```{r}
+options <- rbindlist(
+  lapply(design_shares, function(share) {
+    option <- copy(sw)
+    option[, design_capacity_m3s := share * city_demand_m3s]
+    option
+  }),
+  use.names = TRUE
+)
+
+capacity_designs <- rbindlist(
+  lapply(reference_capacity_fractions, function(share) {
+    option <- copy(sw)
+    option[, design_capacity_m3s :=
+      pmin(city_demand_m3s, share * source_discharge_m3s)
+    ]
+    option
+  }),
+  use.names = TRUE
+)
+
+options <- rbindlist(
+  list(options, capacity_designs),
+  use.names = TRUE
+)
+
+options <- unique(
+  options[is.finite(design_capacity_m3s) & design_capacity_m3s > 0],
+  by = c("urban_id", "source_key", "design_capacity_m3s")
+)
+
+setorder(options, urban_id, source_key, design_capacity_m3s)
+options[, design_id := seq_len(.N), by = .(urban_id, source_key)]
+
+options[, design_capacity_m3_year :=
+  design_capacity_m3s * seconds_per_year
+]
+
+options[, max_delivery_m3_year :=
+  pmin(design_capacity_m3_year, source_capacity_m3_year)
+]
+
+stopifnot(
+  all(options$max_delivery_m3_year > 0),
+  !anyDuplicated(options[, .(urban_id, source_key, design_id)])
+)
+```
+
+## 4. Calculate pipe and pumping requirements
+
+The engineering parameters and capital-cost relationships below come from the previous `6_sw_cost.qmd`. Friction, pump-station construction, and pumping electricity are priced at each pipe's **installed design flow**. This is a constant unit-cost approximation: at lower actual withdrawals, friction and electricity per cubic meter may be lower. Pipe-design costs no longer change when only the allowed source withdrawal fraction changes. Pipes wider than the largest diameter in the cost table are represented by parallel pipes.
+
+```{r}
+design_velocity_ms <- 1.5
+minimum_diameter_m <- 6 * 0.0254
+maximum_diameter_m <- 121 * 0.0254
+route_factor <- 1.20
+roughness_m <- 4.6e-5
+viscosity_m2s <- 1e-6
+gravity_ms2 <- 9.80665
+pump_efficiency <- 0.75
+inflation_1999_to_2019 <- 103.979 / 71.111
+
+max_pipe_flow_m3s <-
+  pi * maximum_diameter_m^2 * design_velocity_ms / 4
+
+options[, n_parallel_pipes := as.integer(
+  ceiling(design_capacity_m3s / max_pipe_flow_m3s)
+)]
+
+options[, pipe_diameter_m := pmax(
+  minimum_diameter_m,
+  sqrt(
+    4 * design_capacity_m3s /
+      (pi * design_velocity_ms * n_parallel_pipes)
+  )
+)]
+
+options[, conveyance_length_m := distance_km * 1000 * route_factor]
+
+# Size pumping for the installed design capacity, independent of the
+# scenario-specific source withdrawal limit. Installed pipe designs have
+# the same costs in every withdrawal-fraction sensitivity scenario.
+options[, design_flow_m3s := design_capacity_m3s]
+
+options[, hydraulic_velocity_ms :=
+  4 * design_flow_m3s /
+    (pi * n_parallel_pipes * pipe_diameter_m^2)
+]
+
+options[, reynolds_number :=
+  hydraulic_velocity_ms * pipe_diameter_m / viscosity_m2s
+]
+
+options[, friction_factor := fifelse(
+  reynolds_number < 2300,
+  64 / reynolds_number,
+  0.25 / log10(
+    roughness_m / (3.7 * pipe_diameter_m) +
+      5.74 / reynolds_number^0.9
+  )^2
+)]
+
+options[, friction_head_m :=
+  friction_factor *
+    (conveyance_length_m / pipe_diameter_m) *
+    hydraulic_velocity_ms^2 / (2 * gravity_ms2)
+]
+
+options[, design_pumping_head_m :=
+  pmax(delta_z_m + 1.05 * friction_head_m, 0)
+]
+
+stopifnot(
+  all(options$pipe_diameter_m <= maximum_diameter_m * (1 + 1e-10)),
+  all(is.finite(options$design_pumping_head_m))
+)
+```
+
+## 5. Calculate annual fixed and variable costs
+
+Fixed cost includes annualized pipeline, intake, and pump-station construction, plus their annual maintenance. Variable cost includes pumping electricity. Costs are in 2019 USD. No city source is chosen in this step.
+
+```{r}
+epa_pipe_cost <- data.table(
+  diameter_in = c(
+    6, 8, 10, 12, 14, 16, 18, 20, 24,
+    30, 36, 42, 60, 84, 90, 96, 120, 121
+  ),
+  cost_1999usd_ft = c(
+    43.44, 45.85, 52.74, 59.64, 75.74, 91.85,
+    107.85, 123.86, 141.51, 177.48, 256.11,
+    354.08, 380, 524, 530, 594, 630, 864
+  )
+)
+
+options[, pipe_cost_1999usd_ft := approx(
+  x = epa_pipe_cost$diameter_in,
+  y = epa_pipe_cost$cost_1999usd_ft,
+  xout = pipe_diameter_m / 0.0254,
+  rule = 2
+)$y]
+
+options[, design_capacity_mgd :=
+  design_capacity_m3s * 22.82446523
+]
+
+options[, pipeline_capex_2019usd :=
+  pipe_cost_1999usd_ft *
+    conveyance_length_m * 3.280839895 *
+    n_parallel_pipes * inflation_1999_to_2019
+]
+
+options[, intake_capex_2019usd :=
+  exp(11.777 + 0.973^2 / 2) *
+    design_capacity_mgd^0.550 * inflation_1999_to_2019
+]
+
+options[, pump_capex_2019usd := fifelse(
+  design_pumping_head_m > 0,
+  exp(12.446 + 1.077^2 / 2) *
+    design_capacity_mgd^0.644 * inflation_1999_to_2019,
+  0
+)]
+
+options[, annualized_capex_2019usd_year :=
+  (pipeline_capex_2019usd + intake_capex_2019usd) *
+    capital_recovery_factor(discount_rate, 50) +
+  pump_capex_2019usd *
+    capital_recovery_factor(discount_rate, 25)
+]
+
+options[, maintenance_cost_2019usd_year :=
+  0.01 * (pipeline_capex_2019usd + intake_capex_2019usd) +
+    0.02 * pump_capex_2019usd
+]
+
+options[, fixed_cost_2019usd_year :=
+  annualized_capex_2019usd_year + maintenance_cost_2019usd_year
+]
+
+options[, variable_cost_2019usd_m3 :=
+  0.002725 * design_pumping_head_m /
+    pump_efficiency * electricity_price_2019usd_kwh
+]
+
+stopifnot(
+  all(is.finite(options$fixed_cost_2019usd_year)),
+  all(options$fixed_cost_2019usd_year >= 0),
+  all(is.finite(options$variable_cost_2019usd_m3)),
+  all(options$variable_cost_2019usd_m3 >= 0)
+)
+```
+
+## 6. Save and check cost options
+
+The output is **one row per city, source, and pipe design**. The available volume for that row is `max_delivery_m3_year`. Costs at any positive delivered volume $q$ up to that limit equal `fixed_cost_2019usd_year` plus `variable_cost_2019usd_m3 * q`. These rows are inputs to the city cost minimization step, not one selected price per city.
+
+```{r}
+output_columns <- c(
+  "urban_id", "source_type", "source_id", "source_key",
+  "candidate_rank", "design_id", "distance_km", "delta_z_m",
+  "source_discharge_m3s", "source_lowflow_m3s",
+  "capacity_flow_basis", "withdrawal_fraction",
+  "source_capacity_m3_year", "demand_m3_year",
+  "design_capacity_m3_year", "max_delivery_m3_year",
+  "n_parallel_pipes", "pipe_diameter_m",
+  "friction_head_m", "design_pumping_head_m",
+  "annualized_capex_2019usd_year",
+  "maintenance_cost_2019usd_year",
+  "fixed_cost_2019usd_year", "variable_cost_2019usd_m3"
+)
+
+options[, withdrawal_fraction := withdrawal_fraction]
+options[, capacity_flow_basis := "mean_annual_naturalized_discharge"]
+
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+fwrite(options[, ..output_columns], output_file)
+
+print(options[, .(
+  cities = uniqueN(urban_id),
+  sources = uniqueN(paste(urban_id, source_key)),
+  design_options = .N,
+  median_fixed_cost_2019usd_year =
+    median(fixed_cost_2019usd_year),
+  median_variable_cost_2019usd_m3 =
+    median(variable_cost_2019usd_m3)
+), by = source_type])
+
+cat("Saved:", output_file, "\n")
+```

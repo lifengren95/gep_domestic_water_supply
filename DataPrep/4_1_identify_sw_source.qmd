@@ -1,0 +1,625 @@
+---
+title: "Identify candidate river, lake, and reservoir sources"
+---
+
+This file creates the broad surface-water candidate list for `4_2_surface_water_shortlist.qmd`. It does not set withdrawal capacities.  Candidate intakes inside mapped protected-area polygons are excluded before ranking. The screen is a study assumption about geographic access, not a determination of water rights. The proposed intake is the closest point on each river reach or lake polygon to the city; a different permitted intake on the same source is not searched for here.
+
+Download the polygon layer of the World Database on Protected Areas from [Protected Planet](https://www.protectedplanet.net/en/search-areas). Use the protected-area (PA) polygons, including terrestrial and inland-water sites.  The combined WDPCA download can also include OECMs and point-only records; this script excludes OECMs and cannot screen areas known only as points.  The protected-area path and polygon layer below refer to the September 2026 WDPA geodatabase in `Data/Raw/WDPA_Sep2026_Public`. Update them only if that dataset is moved or replaced. Keep a record of the downloaded data version.
+
+River reaches must have at least 0.5 m3/s modeled mean annual naturalized flow. The lowest-month flow is retained as an attribute, but it does not exclude reaches from this broad candidate file. Step 4_2 uses both mean annual and lowest-month flow to select complementary river shortlists.  Step 5 calculates source capacity from mean annual flow.  LakeATLAS starts at about 0.1 km2. There is no additional lake-size cutoff in this baseline because we have not checked how a larger threshold would affect known municipal sources. Lake candidates are diversified across nearby sources, high average outlet flow, large area, and reservoir volume. `Vol_res` is a storage descriptor; it is not annual supply.
+
+```{r}
+#| label: setup
+
+library(data.table)
+library(sf)
+library(here)
+library(parallel)
+
+city_file <- here(
+  "Data/Analysis/ghsl_urban_centres_2019_with_muni_demand.csv"
+)
+
+river_gdb <- here(
+  "Data/Raw/RiverATLAS/RiverATLAS_v10.gdb"
+  )
+
+lake_gdb <- here(
+  "Data/raw/LakeATLAS/LakeATLAS_v10.gdb"
+  )
+
+protected_area_path <- here(
+  "Data/Raw/WDPA_Sep2026_Public/WDPA_Sep2026_Public.gdb"
+)
+
+protected_area_layer <- "WDPA_poly_Sep2026"
+
+max_distance_km <- 100
+min_river_meanflow_m3s <- 0.5
+
+# Baseline reproduces the approximate lower area limit of LakeATLAS.
+# Raise this threshold only after checking known municipal lake intakes.
+min_lake_area_km2 <- 0.1
+
+# At most 20 lakes per city, with complementary ranking criteria.
+n_lake_nearest <- 10L
+n_lake_highflow <- 5L
+n_lake_largest_area <- 3L
+n_lake_reservoir <- 2L
+
+tile_size_deg <- 5
+n_cores <- 10L
+protected_point_batch_size <- 25000L
+
+required_inputs <- c(city_file, river_gdb, lake_gdb, protected_area_path)
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+
+if (length(missing_inputs)) {
+  stop(
+    "Missing inputs: ",
+    paste(missing_inputs, collapse = ", "),
+    ". Download the PA polygon dataset and update protected_area_path."
+  )
+}
+
+city <- fread(city_file)
+
+stopifnot(all(c(
+  "urban_id", "lon", "lat", "muni_withdrawal_screen_m3s"
+) %in% names(city)))
+
+city <- city[is.finite(lon) & is.finite(lat)]
+
+stopifnot(!anyDuplicated(city$urban_id))
+
+cities_sf <- st_as_sf(
+  city,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+cities_sf$tile_id <- paste(
+  floor((cities_sf$lon + 180) / tile_size_deg),
+  floor((cities_sf$lat + 90) / tile_size_deg),
+  sep = "_"
+)
+
+tile_ids <- unique(cities_sf$tile_id)
+
+river_layers <- st_layers(river_gdb)$name
+stopifnot(length(river_layers) == 1L)
+river_layer <- river_layers[1L]
+
+lake_layer <- "LakeATLAS_v10_pol"
+stopifnot(lake_layer %in% st_layers(lake_gdb)$name)
+
+pa_layers <- st_layers(protected_area_path)
+
+if (is.null(protected_area_layer)) {
+  polygon_layers <- pa_layers$name[
+    vapply(
+      pa_layers$geomtype,
+      function(type) any(grepl("polygon", type, ignore.case = TRUE)),
+      logical(1)
+    )
+  ]
+
+  if (length(polygon_layers) != 1L) {
+    stop(
+      "Set protected_area_layer to the PA polygon layer. Found: ",
+      paste(polygon_layers, collapse = ", ")
+    )
+  }
+
+  protected_area_layer <- polygon_layers[1L]
+}
+
+stopifnot(protected_area_layer %in% pa_layers$name)
+
+pa_layer_index <- match(protected_area_layer, pa_layers$name)
+pa_crs <- pa_layers$crs[[pa_layer_index]]
+
+if (is.na(pa_crs)) {
+  stop("The protected-area polygon layer needs a defined CRS")
+}
+
+read_protected_tile <- function(search_bbox) {
+  # The bbox must use the layer's CRS for GDAL's spatial filter.
+  filter_bbox <- st_transform(
+    search_bbox,
+    pa_crs
+  )
+
+  pa <- st_read(
+    protected_area_path,
+    layer = protected_area_layer,
+    wkt_filter = st_as_text(filter_bbox),
+    quiet = TRUE
+  )
+
+  if (nrow(pa) == 0L) {
+    return(st_sfc(crs = 4326))
+  }
+
+  # WDPCA uses SITE_TYPE = PA or OECM; WDPA-only files may omit it.
+  pa_type_column <- names(pa)[
+    tolower(names(pa)) == "site_type"
+  ]
+
+  pa_status_column <- names(pa)[
+    tolower(names(pa)) == "status"
+  ]
+
+  if (length(pa_type_column)) {
+    pa <- pa[
+      !is.na(pa[[pa_type_column]]) &
+        toupper(as.character(pa[[pa_type_column]])) == "PA",
+    ]
+  }
+
+  if (length(pa_status_column)) {
+    # Proposed sites are excluded. Sites with unknown status remain.
+    pa <- pa[
+      is.na(pa[[pa_status_column]]) |
+        toupper(as.character(pa[[pa_status_column]])) != "PROPOSED",
+    ]
+  }
+
+  if (nrow(pa) == 0L) {
+    return(st_sfc(crs = 4326))
+  }
+
+  # Repair WDPA polygons in a local projected CRS. Spherical s2 validation
+  # can reject self-crossing WDPA rings even when a projected GEOS repair works.
+  box <- st_bbox(search_bbox)
+  tile_crs <- st_crs(sprintf(
+    paste(
+      "+proj=aeqd",
+      "+lat_0=%.8f",
+      "+lon_0=%.8f",
+      "+datum=WGS84",
+      "+units=m",
+      "+no_defs"
+    ),
+    mean(c(box["ymin"], box["ymax"])),
+    mean(c(box["xmin"], box["xmax"]))
+  ))
+
+  pa <- st_transform(pa, tile_crs)
+  pa <- st_make_valid(pa)
+
+  geometry_types <- as.character(st_geometry_type(pa))
+  if (any(!geometry_types %in% c("POLYGON", "MULTIPOLYGON"))) {
+    pa <- st_collection_extract(pa, "POLYGON", warn = FALSE)
+  }
+
+  st_geometry(pa)
+}
+
+tile_search_bbox <- function(cities_tile) {
+  city_buffers <- st_buffer(
+    st_geometry(cities_tile),
+    dist = max_distance_km * 1000
+  )
+
+  st_as_sfc(st_bbox(city_buffers))
+}
+
+source_point_coordinates <- function(city_point, sources) {
+  city_points <- st_geometry(city_point)[
+    rep(1L, nrow(sources))
+  ]
+
+  nearest_lines <- st_nearest_points(
+    city_points,
+    st_geometry(sources),
+    pairwise = TRUE
+  )
+
+  t(vapply(
+    nearest_lines,
+    function(line) {
+      coords <- st_coordinates(line)
+      coords[nrow(coords), c("X", "Y")]
+    },
+    numeric(2)
+  ))
+}
+
+keep_unprotected_intakes <- function(candidates, protected_polygons) {
+  if (nrow(candidates) == 0L || length(protected_polygons) == 0L) {
+    return(candidates)
+  }
+
+  inside <- rep(FALSE, nrow(candidates))
+  batch_starts <- seq.int(
+    1L,
+    nrow(candidates),
+    by = protected_point_batch_size
+  )
+
+  for (start in batch_starts) {
+    rows <- seq.int(
+      start,
+      min(start + protected_point_batch_size - 1L, nrow(candidates))
+    )
+
+    intakes <- st_as_sf(
+      candidates[rows, .(source_lon, source_lat)],
+      coords = c("source_lon", "source_lat"),
+      crs = 4326
+    )
+    intakes <- st_transform(intakes, st_crs(protected_polygons))
+
+    inside[rows] <- lengths(
+      st_intersects(intakes, protected_polygons)
+    ) > 0L
+  }
+
+  candidates[!inside]
+}
+```
+
+# River candidates
+
+All eligible reaches within 100 km remain available for the network-based shortlist in step 4_2. Each source point is tested against protected areas.
+
+```{r}
+#| label: identify-river-candidates
+
+process_river_tile <- function(tile_id) {
+  cities_tile <- cities_sf[cities_sf$tile_id == tile_id, ]
+  search_bbox <- tile_search_bbox(cities_tile)
+
+  rivers <- st_read(
+    river_gdb,
+    layer = river_layer,
+    wkt_filter = st_as_text(search_bbox),
+    quiet = TRUE
+  )
+
+  if (nrow(rivers) == 0L) {
+    return(NULL)
+  }
+
+  required_fields <- c("HYRIV_ID", "dis_m3_pyr", "dis_m3_pmn")
+  stopifnot(all(required_fields %in% names(rivers)))
+
+  rivers <- rivers[
+    is.finite(rivers$dis_m3_pyr) &
+      rivers$dis_m3_pyr >= min_river_meanflow_m3s,
+  ]
+
+  if (nrow(rivers) == 0L) {
+    return(NULL)
+  }
+
+  nearby <- st_is_within_distance(
+    cities_tile,
+    rivers,
+    dist = max_distance_km * 1000
+  )
+
+  candidates_tile <- rbindlist(lapply(seq_len(nrow(cities_tile)), function(j) {
+    idx <- nearby[[j]]
+    if (length(idx) == 0L) return(NULL)
+
+    distance_m <- as.numeric(st_distance(cities_tile[j, ], rivers[idx, ]))
+    coords <- source_point_coordinates(cities_tile[j, ], rivers[idx, ])
+
+    ord <- order(distance_m, rivers$HYRIV_ID[idx])
+    idx <- idx[ord]
+    distance_m <- distance_m[ord]
+    coords <- coords[ord, , drop = FALSE]
+
+    if (anyDuplicated(rivers$HYRIV_ID[idx])) {
+      stop("Duplicate HYRIV_ID in RiverATLAS spatial query")
+    }
+
+    data.table(
+      urban_id = cities_tile$urban_id[j],
+      river_id = rivers$HYRIV_ID[idx],
+      distance_km = distance_m / 1000,
+      source_lon = coords[, 1L],
+      source_lat = coords[, 2L],
+      river_discharge_m3s = rivers$dis_m3_pyr[idx],
+      river_lowflow_m3s = rivers$dis_m3_pmn[idx],
+      muni_demand_m3s = cities_tile$muni_withdrawal_screen_m3s[j]
+    )
+  }), use.names = TRUE, fill = TRUE)
+
+  if (nrow(candidates_tile) == 0L) return(NULL)
+
+  # Check intake points in batches across the tile, rather than
+  # building a new protected-area index for every city.
+  protected_tile <- read_protected_tile(search_bbox)
+  candidates_tile <- keep_unprotected_intakes(
+    candidates_tile,
+    protected_tile
+  )
+
+  if (nrow(candidates_tile) == 0L) return(NULL)
+
+  candidates_tile[, candidate_rank := seq_len(.N), by = urban_id]
+  candidates_tile
+}
+
+river_parts <- mclapply(
+  tile_ids,
+  process_river_tile,
+  mc.cores = n_cores
+)
+
+river_candidates <- rbindlist(
+  river_parts,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+stopifnot(!anyDuplicated(
+  river_candidates[, .(urban_id, river_id)]
+))
+
+saveRDS(
+  river_candidates,
+  here("Data/Processed/0_river_candidates_raw.rds")
+)
+```
+
+# Lake and reservoir candidates
+
+The default area screen does not remove LakeATLAS's smallest lakes. A higher
+cutoff requires a sensitivity check against known municipal intakes. A lake
+with a recorded `Vol_res > 0` remains eligible even if it falls below the
+chosen area threshold. A positive modeled average outlet flow is required
+for the subsequent flow-based cost scenario.
+Keep up to 20 distinct candidates per city, selected across four rankings.
+For a partially protected lake, this checks the proposed intake point; it does
+not assert that every point on the shoreline has the same protected status.
+
+```{r}
+#| label: identify-lake-candidates
+
+process_lake_tile <- function(tile_id) {
+  cities_tile <- cities_sf[cities_sf$tile_id == tile_id, ]
+  search_bbox <- tile_search_bbox(cities_tile)
+
+  lakes <- st_read(
+    lake_gdb,
+    layer = lake_layer,
+    wkt_filter = st_as_text(search_bbox),
+    quiet = TRUE
+  )
+
+  if (nrow(lakes) == 0L) {
+    return(NULL)
+  }
+
+  required_fields <- c(
+    "Hylak_id", "Lake_type", "Grand_id", "Lake_area",
+    "Vol_total", "Vol_res", "dis_m3_pyr", "dis_m3_pmn",
+    "Elevation"
+  )
+  stopifnot(all(required_fields %in% names(lakes)))
+
+  eligible_size <- (
+    is.finite(lakes$Lake_area) &
+      lakes$Lake_area >= min_lake_area_km2
+  ) | (
+    is.finite(lakes$Vol_res) &
+      lakes$Vol_res > 0
+  )
+
+  lakes <- lakes[
+    eligible_size &
+      is.finite(lakes$dis_m3_pyr) &
+      lakes$dis_m3_pyr > 0,
+  ]
+
+  if (nrow(lakes) == 0L) {
+    return(NULL)
+  }
+
+  lakes <- st_make_valid(lakes)
+
+  nearby <- st_is_within_distance(
+    cities_tile,
+    lakes,
+    dist = max_distance_km * 1000
+  )
+
+  candidates_tile <- rbindlist(lapply(seq_len(nrow(cities_tile)), function(j) {
+    idx <- nearby[[j]]
+    if (length(idx) == 0L) return(NULL)
+
+    distance_m <- as.numeric(st_distance(cities_tile[j, ], lakes[idx, ]))
+    coords <- source_point_coordinates(cities_tile[j, ], lakes[idx, ])
+
+    data.table(
+      urban_id = cities_tile$urban_id[j],
+      lake_id = lakes$Hylak_id[idx],
+      distance_km = distance_m / 1000,
+      source_lon = coords[, 1L],
+      source_lat = coords[, 2L],
+      lake_type = lakes$Lake_type[idx],
+      grand_id = lakes$Grand_id[idx],
+      lake_discharge_m3s = lakes$dis_m3_pyr[idx],
+      lake_lowflow_m3s = lakes$dis_m3_pmn[idx],
+      lake_area_km2 = lakes$Lake_area[idx],
+      lake_volume_mcm = lakes$Vol_total[idx],
+      reservoir_volume_mcm = lakes$Vol_res[idx],
+      lake_elevation_m = lakes$Elevation[idx],
+      muni_demand_m3s = cities_tile$muni_withdrawal_screen_m3s[j]
+    )
+  }), use.names = TRUE, fill = TRUE)
+
+  if (nrow(candidates_tile) == 0L) return(NULL)
+
+  protected_tile <- read_protected_tile(search_bbox)
+  candidates_tile <- keep_unprotected_intakes(
+    candidates_tile,
+    protected_tile
+  )
+
+  if (nrow(candidates_tile) == 0L) return(NULL)
+
+  # Rank only unprotected candidates. .I returns row numbers in the
+  # combined tile table; selecting these rows keeps the original metadata.
+  selected_rows <- candidates_tile[, {
+    nearest <- head(
+      order(distance_km, lake_id),
+      n_lake_nearest
+    )
+
+    highflow <- head(
+      order(-lake_discharge_m3s, distance_km),
+      n_lake_highflow
+    )
+
+    largest_area <- head(
+      order(-lake_area_km2, distance_km),
+      n_lake_largest_area
+    )
+
+    reservoirs <- which(
+      is.finite(reservoir_volume_mcm) &
+        reservoir_volume_mcm > 0
+    )
+
+    large_reservoirs <- if (length(reservoirs)) {
+      reservoirs[head(
+        order(-reservoir_volume_mcm[reservoirs],
+              distance_km[reservoirs]),
+        n_lake_reservoir
+      )]
+    } else {
+      integer()
+    }
+
+    chosen <- unique(c(
+      nearest,
+      highflow,
+      largest_area,
+      large_reservoirs
+    ))
+
+    .(row = .I[chosen])
+  }, by = urban_id]$row
+
+  candidates_tile <- candidates_tile[selected_rows]
+  setorder(candidates_tile, urban_id, distance_km, lake_id)
+  candidates_tile[, candidate_rank := seq_len(.N), by = urban_id]
+  candidates_tile
+}
+
+lake_parts <- mclapply(
+  tile_ids,
+  process_lake_tile,
+  mc.cores = n_cores
+)
+
+lake_candidates <- rbindlist(
+  lake_parts,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+stopifnot(!anyDuplicated(lake_candidates[, .(urban_id, lake_id)]))
+
+lake_counts <- lake_candidates[, .N, by = urban_id]
+stopifnot(all(
+  lake_counts$N <= n_lake_nearest + n_lake_highflow +
+    n_lake_largest_area + n_lake_reservoir
+))
+
+saveRDS(
+  lake_candidates,
+  here("Data/Processed/0_lake_candidates_raw.rds")
+)
+```
+
+# Combine and validate
+
+The combined file retains the metadata needed to audit lake and reservoir
+selection and to compute mean-annual-flow capacity in step 5. Step 4_2 also
+uses lowest-month flow for its additional shortlist. Changing the candidate
+locations means the elevation and downstream cost steps must be rerun.
+
+```{r}
+#| label: combine-and-validate-and-save
+
+river_candidates[, `:=`(
+  source_type = "river",
+  source_id = as.character(river_id),
+  source_discharge_m3s = river_discharge_m3s,
+  source_lowflow_m3s = river_lowflow_m3s,
+  source_elevation_m = NA_real_
+)]
+
+lake_candidates[, `:=`(
+  source_type = "lake",
+  source_id = as.character(lake_id),
+  source_discharge_m3s = lake_discharge_m3s,
+  source_lowflow_m3s = lake_lowflow_m3s,
+  source_elevation_m = lake_elevation_m
+)]
+
+common_columns <- c(
+  "urban_id", "source_type", "source_id", "candidate_rank",
+  "distance_km", "source_lon", "source_lat",
+  "source_discharge_m3s", "source_lowflow_m3s",
+  "source_elevation_m", "muni_demand_m3s"
+)
+
+lake_metadata <- c(
+  "lake_type", "grand_id", "lake_area_km2",
+  "lake_volume_mcm", "reservoir_volume_mcm"
+)
+
+river_part <- river_candidates[, ..common_columns]
+river_part[, (lake_metadata) := NA_real_]
+
+lake_part <- lake_candidates[,
+  c(common_columns, lake_metadata),
+  with = FALSE
+]
+
+surface_water_candidates <- rbindlist(
+  list(river_part, lake_part),
+  use.names = TRUE
+)
+
+stopifnot(
+  !anyDuplicated(surface_water_candidates[
+    , .(urban_id, source_type, source_id)
+  ]),
+  all(is.finite(surface_water_candidates$source_discharge_m3s)),
+  all(surface_water_candidates[
+    source_type == "river", source_discharge_m3s
+  ] >= min_river_meanflow_m3s),
+  all(surface_water_candidates$distance_km <= max_distance_km + 1e-8)
+)
+
+candidate_counts <- surface_water_candidates[
+  , .N, by = .(source_type, urban_id)
+]
+
+print(candidate_counts[, .(
+  cities = .N,
+  candidates = sum(N),
+  median_per_city = median(N),
+  max_per_city = max(N)
+), by = source_type])
+
+print(surface_water_candidates[
+  source_type == "lake",
+  .N,
+  by = lake_type
+])
+
+saveRDS(
+  surface_water_candidates,
+  here("Data/Processed/1_surface_water_candidates.rds")
+)
+```

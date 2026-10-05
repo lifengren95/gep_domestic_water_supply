@@ -1,4 +1,9 @@
-
 .DS_Store
-**.html
-**/x_report
+.Rhistory
+.RData
+.quarto/
+
+*_files/
+z_Archive/
+
+

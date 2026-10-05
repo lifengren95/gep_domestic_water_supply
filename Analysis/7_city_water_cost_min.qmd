@@ -1,0 +1,740 @@
+---
+title: "Minimize municipal water-supply cost by city"
+format: html
+execute:
+  echo: true
+---
+
+Run this file after `6_surface_water_cost_options.qmd`. For each city, it compares groundwater with any number of compatible surface-water sources.  At most one pipe design can be built for each source. The source-conflict file prevents the model from treating two points on the same river flow path as independent supplies.
+
+The model first checks whether the specified sources can meet city demand.  If they can, it finds the least costly combination. Otherwise it records the maximum available supply and the shortage; it does not add a hypothetical backstop. This file reports supply quantities and costs. It does not calculate water-provisioning values or shadow prices.
+
+The city output also reports whether the electricity price used by step 6 is present and whether the groundwater cost and capacity are usable. An `uncovered` result is a shortage among the priced, modeled options; a missing electricity price is recorded separately and is not treated as proof that an unpriced candidate could close the shortage.
+
+The capacity options use 30% of mean annual naturalized discharge. The chosen-source output retains the lake type, area, total volume, and reservoir volume from the shortlist for auditing. These descriptors do not increase annual withdrawal capacity in this model.
+
+## 1. Load and check inputs
+
+```{r}
+#| label: load_inputs
+
+if (!requireNamespace("highs", quietly = TRUE)) {
+  stop("Install the highs R package before running this file")
+}
+
+# A tight gap matters when comparing costs after a small capacity change.
+# HiGHS 1.14 presolve gave an incorrect optimum for urban_id 3105;
+# solving that city with presolve off restored a cheaper feasible optimum.
+solver_control <- 
+  highs::highs_control(
+    threads = 1L,
+    log_to_console = FALSE,
+    mip_rel_gap = 1e-8,
+    mip_abs_gap = 0,
+    presolve = "off"
+  )
+
+analysis_dir <- here("Data/Analysis")
+
+seconds_per_year <- 365.25 * 24 * 60 * 60
+
+gw_scenario <- "0.3PD_0.25DL_0.2RR"
+
+sw_file <- 
+  file.path(
+    analysis_dir, 
+    "city_surface_water_capacity_options.csv"
+  )
+
+conflict_file <- 
+  file.path(
+    analysis_dir,
+    "surface_water_conflicts.rds"
+  )
+
+gw_file <- 
+  file.path(
+    analysis_dir,
+    "ghsl_cities_gw_cost_compressed_20260921.csv"
+  )
+
+demand_file <- 
+    file.path(
+    analysis_dir,
+    "ghsl_urban_centres_2019_with_muni_demand.csv"
+  )
+
+candidate_metadata_file <- 
+  here(
+    "Data/Processed/1_surface_water_candidates_shortlist.rds"
+  )
+
+price_file <- 
+  here(
+    "Data/Processed/uc_2025_with_electricity_price.rds"
+  )
+
+input_files <- 
+  c(
+    sw_file, conflict_file, gw_file, demand_file,
+    candidate_metadata_file, price_file
+  )
+
+if (!all(file.exists(input_files))) {
+  stop(
+    "Missing input file(s): ",
+    paste(input_files[!file.exists(input_files)], collapse = ", ")
+  )
+}
+
+sw <- fread(sw_file)
+conflicts <- as.data.table(readRDS(conflict_file))
+
+required_sw <- 
+  c(
+    "urban_id", "source_key", "source_type", "source_id",
+    "design_id", "source_capacity_m3_year",
+    "design_capacity_m3_year", "max_delivery_m3_year",
+    "demand_m3_year", "fixed_cost_2019usd_year",
+    "variable_cost_2019usd_m3", "candidate_rank", "distance_km",
+    "delta_z_m", "source_discharge_m3s", "source_lowflow_m3s",
+    "capacity_flow_basis", "withdrawal_fraction",
+    "n_parallel_pipes", "pipe_diameter_m", "friction_head_m",
+    "design_pumping_head_m", "annualized_capex_2019usd_year",
+    "maintenance_cost_2019usd_year"
+  )
+
+stopifnot(
+  all(required_sw %in% names(sw)),
+  all(c("urban_id", "source_key_a", "source_key_b") %in%
+        names(conflicts)),
+  nrow(sw) > 0L,
+  !anyDuplicated(sw[, .(urban_id, source_key, design_id)]),
+  all(is.finite(sw$source_capacity_m3_year)),
+  all(is.finite(sw$max_delivery_m3_year)),
+  all(is.finite(sw$fixed_cost_2019usd_year)),
+  all(is.finite(sw$variable_cost_2019usd_m3)),
+  all(sw$source_capacity_m3_year > 0),
+  all(sw$max_delivery_m3_year > 0),
+  all(sw$fixed_cost_2019usd_year >= 0),
+  all(sw$variable_cost_2019usd_m3 >= 0),
+  uniqueN(sw$withdrawal_fraction) == 1L,
+  uniqueN(sw$capacity_flow_basis) == 1L,
+  unique(sw$capacity_flow_basis) ==
+    "mean_annual_naturalized_discharge",
+  all(is.finite(sw$source_discharge_m3s)),
+  all(abs(
+    sw$source_capacity_m3_year -
+      sw$withdrawal_fraction *
+        sw$source_discharge_m3s * seconds_per_year
+  ) <= pmax(1e-2, 1e-7 * sw$source_capacity_m3_year))
+)
+
+withdrawal_fraction_used <- unique(sw$withdrawal_fraction)
+scenario_tag <- as.integer(round(100 * withdrawal_fraction_used))
+
+selected_output_columns <- 
+  c(
+    "urban_id", "source_type", "source_id", "source_key",
+    "design_id", "source_capacity_m3_year",
+    "design_capacity_m3_year", "max_delivery_m3_year",
+    "fixed_cost_2019usd_year", "variable_cost_2019usd_m3",
+    "candidate_rank", "distance_km", "delta_z_m",
+    "source_discharge_m3s", "source_lowflow_m3s",
+    "capacity_flow_basis", "withdrawal_fraction",
+    "demand_m3_year", "n_parallel_pipes", "pipe_diameter_m",
+    "friction_head_m", "design_pumping_head_m",
+    "annualized_capex_2019usd_year",
+    "maintenance_cost_2019usd_year"
+  )
+
+source_capacity_check <- 
+  sw[
+    , .(
+      n_capacities = uniqueN(source_capacity_m3_year)
+    ), by = .(urban_id, source_key)
+  ]
+
+stopifnot(all(source_capacity_check$n_capacities == 1L))
+rm(source_capacity_check)
+
+gw_cost_col <- paste0("gw_unit_cost_2019_usd_m3_", gw_scenario)
+gw_capacity_col <- paste0("gw_capacity_m3_year_", gw_scenario)
+
+gw <- 
+  fread(
+    gw_file,
+    select = c("urban_id", gw_cost_col, gw_capacity_col)
+  )
+
+setnames(
+  gw,
+  c(gw_cost_col, gw_capacity_col),
+  c("gw_cost_2019usd_m3", "gw_capacity_m3_year")
+)
+
+demand <- 
+  fread(
+    demand_file,
+    select = c("urban_id", "muni_withdrawal_screen_m3s")
+  )
+
+stopifnot(
+  !anyDuplicated(gw$urban_id),
+  !anyDuplicated(demand$urban_id)
+)
+
+demand[
+  , demand_m3_year := muni_withdrawal_screen_m3s * seconds_per_year
+]
+
+demand <- 
+  demand[
+    is.finite(demand_m3_year) & demand_m3_year > 0,
+    .(urban_id, demand_m3_year)
+  ]
+
+demand[
+  gw,
+  `:=`(
+    gw_cost_2019usd_m3 = i.gw_cost_2019usd_m3,
+    gw_capacity_m3_year = i.gw_capacity_m3_year
+  ),
+  on = "urban_id"
+]
+
+sw[
+  demand,
+  checked_demand_m3_year := i.demand_m3_year,
+  on = "urban_id"
+]
+
+stopifnot(
+  all(is.finite(sw$checked_demand_m3_year)),
+  all(
+    abs(sw$demand_m3_year - sw$checked_demand_m3_year) <=
+      pmax(1e-4, 1e-7 * sw$checked_demand_m3_year)
+  )
+)
+
+sw[, checked_demand_m3_year := NULL]
+setkey(sw, urban_id)
+setkey(conflicts, urban_id)
+
+cat("Cities with demand:", nrow(demand), "\n")
+cat("Priced surface sources:",
+    uniqueN(sw[, .(urban_id, source_key)]), "\n")
+```
+
+## 2. Check maximum available supply
+
+Water volumes inside the solver are measured as fractions of a city's annual demand. A source contributes at most its modeled capacity; two conflicting sources cannot both be used. Groundwater is used only when its cost and capacity are available.
+
+```{r}
+#| label: check-max-available-supply
+
+usable_groundwater_capacity <- function(cost, capacity, demand) {
+
+  if (
+    !is.finite(cost) || cost < 0 ||
+    !is.finite(capacity) || capacity <= 0
+  ) {
+    return(0)
+  }
+
+  min(capacity, demand)
+}
+
+
+maximum_supply <- function(city_sw, city_conflicts, groundwater_capacity, city_demand){
+
+  sources <- 
+    unique(
+      city_sw[, .(source_key, source_capacity_m3_year)],
+      by = "source_key"
+    )
+
+  n_sources <- nrow(sources)
+
+  if (n_sources == 0L) {
+    return(groundwater_capacity)
+  }
+
+  source_index <- setNames(seq_len(n_sources), sources$source_key)
+
+  flow <- seq_len(n_sources)
+  active <- n_sources + seq_len(n_sources)
+  groundwater <- 2L * n_sources + 1L
+
+  n_rows <- 1L + n_sources + nrow(city_conflicts) + 1L
+  A <- matrix(0, nrow = n_rows, ncol = groundwater)
+  rhs <- numeric(n_rows)
+
+  # Do not count water beyond the city's demand.
+  A[1L, c(flow, groundwater)] <- 1
+  rhs[1L] <- 1
+
+  for (j in seq_len(n_sources)) {
+    row <- 1L + j
+    A[row, flow[j]] <- 1
+    A[row, active[j]] <- -min(
+      1,
+      sources$source_capacity_m3_year[j] / city_demand
+    )
+  }
+
+  for (j in seq_len(nrow(city_conflicts))) {
+    a <- source_index[city_conflicts$source_key_a[j]]
+    b <- source_index[city_conflicts$source_key_b[j]]
+
+    row <- 1L + n_sources + j
+    A[row, active[c(a, b)]] <- 1
+    rhs[row] <- 1
+  }
+
+  A[n_rows, groundwater] <- 1
+  rhs[n_rows] <- groundwater_capacity / city_demand
+
+  objective <- numeric(groundwater)
+  objective[c(flow, groundwater)] <- 1
+
+  types <- rep("C", groundwater)
+  types[active] <- "I"
+
+  fit <- highs::highs_solve(
+    L = objective,
+    lower = rep(0, groundwater),
+    upper = rep(1, groundwater),
+    A = A,
+    lhs = rep(-Inf, n_rows),
+    rhs = rhs,
+    types = types,
+    maximum = TRUE,
+    control = solver_control
+  )
+
+  if (!identical(fit$status_message, "Optimal")) {
+    stop("Maximum-supply solver status: ", fit$status_message)
+  }
+
+  solution <- fit$primal_solution
+  residual <- as.vector(A %*% solution - rhs)
+  if (
+    any(residual > 1e-6) ||
+    any(abs(solution[active] - round(solution[active])) > 1e-6)
+  ) {
+    stop("HiGHS returned an infeasible maximum-supply solution")
+  }
+
+  pmin(city_demand, pmax(0, fit$objective_value * city_demand))
+}
+```
+
+## 3. Find the minimum-cost supply combination
+
+The objective is the annual sum of fixed connection costs and variable pumping or groundwater costs. Every source can use at most one design.  An option's maximum delivery is the smaller of its pipe capacity and source capacity. All eligible, non-conflicting sources remain available to the city.
+
+```{r}
+#| label: define-function-minimize-city-cost
+
+minimize_city_cost <- function(city_sw, city_conflicts, groundwater_cost, groundwater_capacity, city_demand) {
+
+  n_options <- nrow(city_sw)
+
+  if (n_options == 0L) {
+    selected <- copy(city_sw[0, ..selected_output_columns])
+    selected[, `:=`(
+      quantity_m3_year = numeric(),
+      source_cost_2019usd_year = numeric()
+    )]
+
+    return(list(
+      total_cost = groundwater_cost * city_demand,
+      groundwater_m3_year = city_demand,
+      selected = selected
+    ))
+  }
+
+  sources <- unique(city_sw$source_key)
+  n_sources <- length(sources)
+
+  source_index <- setNames(
+    seq_len(n_sources),
+    sources
+  )
+
+  flow <- seq_len(n_options)
+  built <- n_options + seq_len(n_options)
+  groundwater <- 2L * n_options + 1L
+
+  n_rows <- 1L + n_options + n_sources +
+    nrow(city_conflicts) + 1L
+
+  A <- matrix(0, nrow = n_rows, ncol = groundwater)
+  rhs <- numeric(n_rows)
+  direction <- c("=", rep("<=", n_rows - 1L))
+
+  # Exactly meet demand when there is enough modeled supply.
+  A[1L, c(flow, groundwater)] <- 1
+  rhs[1L] <- 1
+
+  # Flow is possible only through a built design, up to its limit.
+  for (j in seq_len(n_options)) {
+    row <- 1L + j
+    A[row, flow[j]] <- 1
+    A[row, built[j]] <- -min(
+      1,
+      city_sw$max_delivery_m3_year[j] / city_demand
+    )
+  }
+
+  for (j in seq_len(n_sources)) {
+    indices <- which(city_sw$source_key == sources[j])
+    row <- 1L + n_options + j
+    A[row, built[indices]] <- 1
+    rhs[row] <- 1
+  }
+
+  for (j in seq_len(nrow(city_conflicts))) {
+    a <- source_index[city_conflicts$source_key_a[j]]
+    b <- source_index[city_conflicts$source_key_b[j]]
+
+    indices <- which(city_sw$source_key %in% sources[c(a, b)])
+    row <- 1L + n_options + n_sources + j
+    A[row, built[indices]] <- 1
+    rhs[row] <- 1
+  }
+
+  A[n_rows, groundwater] <- 1
+  rhs[n_rows] <- groundwater_capacity / city_demand
+
+  objective <- c(
+    city_sw$variable_cost_2019usd_m3,
+    city_sw$fixed_cost_2019usd_year / city_demand,
+    if (groundwater_capacity > 0) groundwater_cost else 0
+  )
+
+  types <- rep("C", groundwater)
+  types[built] <- "I"
+
+  fit <- highs::highs_solve(
+    L = objective,
+    lower = rep(0, groundwater),
+    upper = rep(1, groundwater),
+    A = A,
+    lhs = ifelse(direction == "=", rhs, -Inf),
+    rhs = rhs,
+    types = types,
+    control = solver_control
+  )
+
+  if (!identical(fit$status_message, "Optimal")) {
+    stop("Minimum-cost solver status: ", fit$status_message)
+  }
+
+  solution <- fit$primal_solution
+  residual <- as.vector(A %*% solution - rhs)
+  tolerance <- 1e-6
+  if (
+    abs(residual[1L]) > tolerance ||
+    any(residual[-1L] > tolerance) ||
+    any(abs(solution[built] - round(solution[built])) > tolerance)
+  ) {
+    stop("HiGHS returned a solution that fails model constraints")
+  }
+
+  selected <- copy(city_sw[
+    which(solution[built] > 0.5),
+    ..selected_output_columns
+  ])
+
+  selected[, quantity_m3_year :=
+    solution[flow][solution[built] > 0.5] * city_demand
+  ]
+
+  selected[, source_cost_2019usd_year :=
+    fixed_cost_2019usd_year +
+      variable_cost_2019usd_m3 * quantity_m3_year
+  ]
+
+  list(
+    total_cost = fit$objective_value * city_demand,
+    groundwater_m3_year = solution[groundwater] * city_demand,
+    selected = selected
+  )
+}
+```
+
+## 4. Solve each city
+
+The conflict file describes all shortlisted sources, including some that may have been excluded from the cost file because they lack an electricity price.  Only conflict pairs with **both** sources in the priced city options enter a city's optimization. This does not remove any constraint between two available, priced sources.
+
+```{r}
+#| label: solve-each-city
+
+city_results <- vector("list", nrow(demand))
+source_results <- vector("list", nrow(demand))
+
+for (i in seq_len(nrow(demand))) {
+  # Test run
+  # i = 1
+
+  id <- demand$urban_id[i]
+  d <- demand$demand_m3_year[i]
+
+  city_sw <- sw[.(id), nomatch = 0L]
+  city_conflicts <- conflicts[.(id), nomatch = 0L]
+
+  available_keys <- unique(city_sw$source_key)
+  city_conflicts <- city_conflicts[
+    source_key_a %in% available_keys &
+      source_key_b %in% available_keys
+  ]
+
+  gw_capacity <- usable_groundwater_capacity(
+    cost = demand$gw_cost_2019usd_m3[i],
+    capacity = demand$gw_capacity_m3_year[i],
+    demand = d
+  )
+
+  max_supply <- tryCatch(
+    maximum_supply(city_sw, city_conflicts, gw_capacity, d),
+    error = function(e) {
+      stop("At urban_id ", id, ": ", conditionMessage(e))
+    }
+  )
+
+  if (max_supply < d * (1 - 1e-7)) {
+    city_results[[i]] <- data.table(
+      urban_id = id,
+      withdrawal_fraction = withdrawal_fraction_used,
+      status = "uncovered",
+      demand_m3_year = d,
+      max_supply_m3_year = max_supply,
+      unmet_demand_m3_year = d - max_supply,
+      surface_m3_year = NA_real_,
+      groundwater_m3_year = NA_real_,
+      n_surface_sources = NA_integer_,
+      surface_cost_2019usd_year = NA_real_,
+      groundwater_cost_2019usd_year = NA_real_,
+      total_cost_2019usd_year = NA_real_
+    )
+
+    next
+  }
+
+  solution <- tryCatch(
+    minimize_city_cost(
+      city_sw = city_sw,
+      city_conflicts = city_conflicts,
+      groundwater_cost = demand$gw_cost_2019usd_m3[i],
+      groundwater_capacity = gw_capacity,
+      city_demand = d
+    ),
+    error = function(e) {
+      stop("At urban_id ", id, ": ", conditionMessage(e))
+    }
+  )
+
+  selected <- solution$selected
+  source_results[[i]] <- selected
+
+  sw_volume <- sum(selected$quantity_m3_year)
+  sw_cost <- sum(selected$source_cost_2019usd_year)
+  gw_cost <- if (gw_capacity > 0) {
+    demand$gw_cost_2019usd_m3[i] * solution$groundwater_m3_year
+  } else {
+    0
+  }
+
+  city_results[[i]] <- data.table(
+    urban_id = id,
+    withdrawal_fraction = withdrawal_fraction_used,
+    status = "covered",
+    demand_m3_year = d,
+    max_supply_m3_year = max_supply,
+    unmet_demand_m3_year = 0,
+    surface_m3_year = sw_volume,
+    groundwater_m3_year = solution$groundwater_m3_year,
+    n_surface_sources = nrow(selected),
+    surface_cost_2019usd_year = sw_cost,
+    groundwater_cost_2019usd_year = gw_cost,
+    total_cost_2019usd_year = solution$total_cost
+  )
+
+  if (i %% 500L == 0L) {
+    message("Solved ", i, " / ", nrow(demand), " cities")
+  }
+}
+
+city_results <- rbindlist(city_results)
+source_results <- rbindlist(source_results, fill = TRUE)
+
+# Report input coverage alongside the optimization outcome. A missing city
+# electricity price makes surface-water options unavailable in step 6.
+# This flag does not establish whether adding prices would meet demand.
+prices <- as.data.table(readRDS(price_file))[
+  , .(urban_id, electricity_price_2019usd_kwh)
+]
+stopifnot(!anyDuplicated(prices$urban_id))
+
+city_results[
+  prices,
+  electricity_price_2019usd_kwh :=
+    i.electricity_price_2019usd_kwh,
+  on = "urban_id"
+]
+
+city_results[
+  demand,
+  `:=`(
+    gw_cost_input_2019usd_m3 = i.gw_cost_2019usd_m3,
+    gw_capacity_input_m3_year = i.gw_capacity_m3_year
+  ),
+  on = "urban_id"
+]
+
+city_results[, has_valid_city_electricity_price :=
+  is.finite(electricity_price_2019usd_kwh) &
+    electricity_price_2019usd_kwh >= 0
+]
+
+city_results[, groundwater_input_status := fcase(
+  !is.finite(gw_capacity_input_m3_year),
+  "missing_groundwater_capacity",
+  gw_capacity_input_m3_year <= 0,
+  "no_positive_groundwater_capacity",
+  !is.finite(gw_cost_input_2019usd_m3) |
+    gw_cost_input_2019usd_m3 < 0,
+  "missing_groundwater_cost",
+  default = "usable_groundwater_cost_and_capacity"
+)]
+
+city_results[, input_coverage_status := fcase(
+  status == "uncovered" & !has_valid_city_electricity_price,
+  "uncovered_with_missing_city_electricity_price",
+  status == "uncovered",
+  "uncovered_with_valid_city_electricity_price",
+  default = "covered"
+)]
+
+city_results[, c(
+  "gw_cost_input_2019usd_m3",
+  "gw_capacity_input_m3_year"
+) := NULL]
+
+stopifnot(all(city_results[
+  urban_id %in% sw$urban_id,
+  has_valid_city_electricity_price
+]))
+
+if (is.null(source_results)) {
+  source_results <- copy(sw[0, ..selected_output_columns])
+  source_results[, `:=`(
+    quantity_m3_year = numeric(),
+    source_cost_2019usd_year = numeric()
+  )]
+}
+
+covered <- city_results[status == "covered"]
+
+stopifnot(
+  nrow(city_results) == nrow(demand),
+  !anyDuplicated(city_results$urban_id),
+  !anyDuplicated(source_results[, .(urban_id, source_key)]),
+  all(abs(
+    covered$surface_m3_year +
+      covered$groundwater_m3_year -
+      covered$demand_m3_year
+  ) <= pmax(1e-3, 1e-6 * covered$demand_m3_year)),
+  all(abs(
+    covered$surface_cost_2019usd_year +
+      covered$groundwater_cost_2019usd_year -
+      covered$total_cost_2019usd_year
+  ) <= pmax(1e-2, 1e-6 * covered$total_cost_2019usd_year))
+)
+
+# Attach lake descriptors only to chosen sources. Keeping these fields out
+# of the pipe-option table avoids repeating them for every pipe design.
+candidate_metadata <- as.data.table(readRDS(candidate_metadata_file))
+
+metadata_columns <- c(
+  "urban_id", "source_type", "source_id", "lake_type",
+  "grand_id", "lake_area_km2", "lake_volume_mcm",
+  "reservoir_volume_mcm"
+)
+
+stopifnot(all(metadata_columns %in% names(candidate_metadata)))
+
+lake_metadata <- candidate_metadata[
+  source_type == "lake",
+  ..metadata_columns
+]
+
+# fread() may infer numeric source IDs from the cost CSV, while the RDS
+# stores IDs as character strings. Join using the same representation.
+lake_metadata[, source_id := as.character(source_id)]
+source_results[, source_id := as.character(source_id)]
+
+stopifnot(!anyDuplicated(
+  lake_metadata[, .(urban_id, source_type, source_id)]
+))
+
+chosen_lakes <- source_results[
+  source_type == "lake",
+  .(urban_id, source_type, source_id)
+]
+
+stopifnot(
+  nrow(lake_metadata[
+    chosen_lakes,
+    on = .(urban_id, source_type, source_id),
+    nomatch = 0L
+  ]) == nrow(chosen_lakes)
+)
+
+source_results <- merge(
+  source_results,
+  lake_metadata,
+  by = c("urban_id", "source_type", "source_id"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+stopifnot(
+  !anyDuplicated(source_results[, .(urban_id, source_key)])
+)
+```
+
+## 5. Save supply and cost results
+
+These supply results are saved with the `x_` prefix in `Data/Analysis`.
+Step 8 and 9 reads these two files.
+
+```{r}
+fwrite(
+  city_results,
+  file.path(
+    analysis_dir,
+    paste0("x_city_municipal_water_supply_", scenario_tag, ".csv")
+  )
+)
+
+fwrite(
+  source_results,
+  file.path(
+    analysis_dir,
+    paste0("x_city_surface_water_chosen_designs_", scenario_tag, ".csv")
+  )
+)
+
+print(city_results[, .(
+  cities = .N,
+  total_demand_m3_year = sum(demand_m3_year),
+  total_surface_m3_year = sum(surface_m3_year, na.rm = TRUE),
+  total_groundwater_m3_year = sum(groundwater_m3_year, na.rm = TRUE),
+  total_unmet_demand_m3_year = sum(unmet_demand_m3_year)
+), by = status])
+
+cat("Saved city and chosen-source results in", analysis_dir, "\n")
+```

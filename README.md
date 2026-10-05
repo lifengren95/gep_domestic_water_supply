@@ -1,44 +1,74 @@
 # GEP: water use
 
-**Objective:** Compute the Gross Ecosystem Product of water used for agricultural, domestic and industrial sector in the world.
+**Objective:** Estimate the annual replacement cost of municipal raw-water provisioning for urban centres worldwide. The analysis compares the least-cost modeled supply portfolio for each city with the least-cost feasible portfolio available after the selected sources and their recorded shared-flow alternatives are removed.
 
 
 ## Descriptions:
 
-From [AQUASTAT (FAO's Global Information System on Water and Agriculture)](https://www.fao.org/aquastat/en/) website, we downloaded the datasets on country-level water use efficiency and water withdrawal for different sectors (agriculture, domestic and industrial) for all countries in the world over the period of 2007 - 2022. 
+The analysis uses 2025 urban centres and population-weighted centroids from [GHS-WUP-MTUC R2025A](https://human-settlement.emergency.copernicus.eu/ghs_wup_mtuc_r2025a.php). We estimate each city's annual municipal water demand by multiplying its population by its country's 2019 municipal withdrawal per capita from [FAO AQUASTAT](https://www.fao.org/aquastat/en/). These are estimated demands, not observations of each city's actual withdrawals.
 
 
-+ Water Use Efficiency (WUE) measures how much economic output (e.g., crop value) is generated per unit of water used ($\$/m^3$) for each sector. We use this metric as a proxy for the price of water. 
-  + According to the methodology outlined by FAO, the dollar values were deflated to a baseline year 2015.
-  + We use the following three types of water use efficiency data:
-    + Agricultural water use efficiency
-    + Industrial water use efficiency
-    + Municipal water use efficiency
++ Candidate river reaches, lakes and reservoirs come from RiverATLAS and LakeATLAS. We search within 100 km of each city, screen small sources and exclude proposed intake points inside mapped protected areas from the World Database on Protected Areas. A shortlist retains several kinds of river and lake alternatives and records source pairs that share a modeled flow path.
++ FABDEM, supplemented by Copernicus DEM GLO-30 where needed, provides elevations for cities and candidate intakes. Source distance, elevation difference, pipe design and city electricity price determine the surface-water cost options. The cost of a selected design includes annualized intake, pipeline and, where needed, pump-station construction and maintenance, plus electricity per cubic meter delivered.
++ For the 30% withdrawal scenario, a city's modeled annual source capacity is at most 30% of a river's mean annual flow or a lake or reservoir's mean outlet flow, converted to an annual volume. Groundwater costs and capacities come from the prepared city-level groundwater input. The city optimization meets estimated demand with the least-cost feasible mix of groundwater and compatible surface-water sources.
++ The main replacement scenario removes the sources used in that baseline portfolio and the recorded direct shared-flow conflict partners of selected surface-water sources. A separate sensitivity scenario removes only the selected source candidates. Each replacement model holds demand and cost assumptions fixed. Its additional annual cost is reported only when both the baseline and replacement portfolios are feasible. Missing input prices and infeasible portfolios are documented separately; undefined replacement costs are not treated as zero.
+
 
 <br>
 
-+ For quantity of water used, we use the reported volume of water withdrawn for each sector (agriculture, domestic and industrial) in each country. 
-  + We use the following three types of water withdrawal data:
-    + Agricultural Water withdrawal
-    + Industrial water withdrawal
-    + Municipal water withdrawal
 
+The scripts run in this order:
 
-+ Further descriptions of the data are illustrated by [this pdf](https://unstats.un.org/sdgs/metadata/files/metadata-06-04-01.pdf). 
-+ About water use efficiency calculation, see [this pdf: Progress on Water-use Efficiency Global baseline for SDG indicator 6.4.1 - 2018](https://openknowledge.fao.org/server/api/core/bitstreams/603a9f36-61cf-42dd-978e-da846e5d76b0/content)
+1. `1_population_center.qmd` — prepare urban centres and their representative locations.
+2. `2_city_demand.qmd` — estimate city-level municipal water demand.
+3. `3_get_electricity_price.qmd` — assign 2019 electricity prices to cities.
+4. `4_1_identify_sw_source.qmd` — identify broad river, lake and reservoir candidates.
+5. `4_2_surface_water_shortlist.qmd` — shortlist candidates and record shared-flow conflicts.
+6. `5_1_elevation_updated.qmd` — extract and reuse elevations for cities and intake points.
+7. `5_2_elevation_difference.qmd` — calculate source-to-city elevation differences.
+8. `6_surface_water_cost_options.qmd` — calculate pipe-design capacities and fixed and variable surface-water costs.
+9. `7_city_water_cost_min.qmd` — find the baseline least-cost supply portfolio for each city.
+10. `8_selected_portfolio_replacement_cost.qmd` — calculate the main shared-flow-path replacement scenario.
+11. `9_selected_portfolio_replacement_cost.qmd` — calculate the selected-candidates-only sensitivity scenario. Both replacement scripts use the baseline outputs from `7_city_water_cost_min.qmd`.
+12. `10_country_municipal_replacement_cost.qmd` — aggregate the main scenario by country.
 
-+ [FAO AQUASTAT and the SDG indicators 6.4.1. and 6.4.2.](https://unstats.un.org/unsd/envstats/fdes/EGES7/Sess3_FAO2_%20AQUASTAT.pdf)
+The city-level baseline outputs are `Data/Analysis/x_city_municipal_water_supply_30.csv` and `Data/Analysis/x_city_surface_water_chosen_designs_30.csv`. The main replacement result is `Data/Analysis/y_city_shared_flowpath_replacement_30.csv`. The sensitivity result is `Data/Analysis/z_city_selected_portfolio_replacement_30.csv`. Country summaries are saved under `Data/Results/`. Country totals sum values only for cities with feasible baseline and replacement portfolios; the files also report coverage and reasons that other cities have no calculated value.
 
 
 ## Folder Structures:
 
-To reproduce the results, please follow the folder structures below:
+To reproduce the municipal analysis, keep the scripts and input data in the following project structure. The QMD files use `here()` paths relative to the project root.
 
-```bash
+```text
 .
-├── script
+├── README.md
+├── 1_population_center.qmd
+├── 2_city_demand.qmd
+├── 3_get_electricity_price.qmd
+├── 4_1_identify_sw_source.qmd
+├── 4_2_surface_water_shortlist.qmd
+├── 5_1_elevation_updated.qmd
+├── 5_2_elevation_difference.qmd
+├── 6_surface_water_cost_options.qmd
+├── 7_city_water_cost_min.qmd
+├── 8_selected_portfolio_replacement_cost.qmd
+├── 9_selected_portfolio_replacement_cost.qmd
+├── 10_country_municipal_replacement_cost.qmd
 └── Data
-  └── raw
-    └── AQUASTAT_2007_2022.csv
+    ├── Raw
+    │   ├── GHS_WUP_MTUC_R2025A/
+    │   ├── RiverATLAS/RiverATLAS_v10.gdb/
+    │   ├── WDPA_Sep2026_Public/WDPA_Sep2026_Public.gdb/
+    │   ├── Boundary/z_ee_r250_correspondence.gpkg
+    │   └── boundary/z_ee_r250_correspondence.gpkg
+    ├── raw
+    │   ├── AQUASTAT/AQUASTAT_muni_withdrawal_per_capita.csv
+    │   └── LakeATLAS/LakeATLAS_v10.gdb/
+    ├── Processed
+    │   └── FABDEM/
+    ├── Analysis
+    │   └── ghsl_cities_gw_cost_compressed_20260921.csv
+    └── Results/
 ```
 
+The scripts also obtain World Bank electricity-price data and FABDEM elevation tiles. The current files refer to both `Data/Raw` and `Data/raw`, and to both `Boundary` and `boundary`. Check these path spellings when running on a case-sensitive filesystem.

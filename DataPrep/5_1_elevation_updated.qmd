@@ -1,0 +1,1493 @@
+---
+title: "Get and reuse elevation data for cities and surface-water intakes"
+---
+
+
+`surface_water_candidates` contains:
+
++ elevation for lakes and reservoirs: `source_elevation_m`
+
+We need to get the (1) elevation for population centers `i` and (2) elevation for river reaches `s` 
+
+# Data
++ FABDEM V1-2
+  + 30m resolution (1 arc-second)
+  + It is derived from Copernicus GLO-30 but specifically removes building and forest-height biases, so it is closer to bare-earth terrain elevation.
+  + Its horizontal reference is WGS84 and vertical elevations are referenced to EGM2008.
+  + It is much more suitable than a DSM for urban-centre centroids in particular.
+
+
+```{r}
+uc_2025 <- 
+  readRDS(
+    here("Data/Processed/ghsl_urban_centres_2025.rds")
+  )
+
+surface_water_candidates <- 
+  readRDS(
+    here("Data/Processed/1_surface_water_candidates_shortlist.rds")
+  )
+
+# range(uc_2025$lat, na.rm = TRUE)
+# range(surface_water_candidates$source_lat, na.rm = TRUE)
+```
+
+
+```{r}
+# Read the FABDEM tile index
+fabdem_tiles <- 
+  st_read(
+    here("Data/Raw/FABDEM/FABDEM_v1-2_tiles.geojson"),
+    quiet = TRUE
+  )
+
+# Create all locations wehre we need elevation =
+fabdem_points <- 
+  rbindlist(
+    list(
+      # Population centers i
+      uc_2025[, .(point_type = "urban", lon, lat)], 
+      # river reaches s
+      surface_water_candidates[, .(point_type = "source", lon = source_lon, lat = source_lat)]
+    )
+  )
+
+fabdem_points <- unique(fabdem_points[ is.finite(lon) & is.finite(lat) ])
+
+# Verify that FABDEM covers all required points
+fabdem_points_sf <- 
+  st_as_sf(
+    fabdem_points,
+    coords = c("lon", "lat"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+fabdem_covered <- lengths(st_intersects(fabdem_points_sf, fabdem_tiles)) > 0L
+fabdem_uncovered <- fabdem_points_sf[!fabdem_covered, ]
+
+table(fabdem_covered)
+table(fabdem_uncovered$point_type)
+
+
+if (nrow(fabdem_uncovered)) {
+  nearest_tile <- st_nearest_feature(fabdem_uncovered, fabdem_tiles)
+
+  fabdem_uncovered$distance_to_fabdem_m <- as.numeric(
+    st_distance(
+      fabdem_uncovered,
+      fabdem_tiles[nearest_tile, ],
+      by_element = TRUE
+    )
+  )
+
+  summary(fabdem_uncovered$distance_to_fabdem_m)
+}
+
+fabdem_uncovered_dt <- as.data.table(st_drop_geometry(fabdem_uncovered))
+```
+
+
+
+
+# Reuse previously completed elevations by exact point type and coordinates
+
+```{r}
+fabdem_points_sf$elev_point_id <- seq_len(nrow(fabdem_points_sf))
+fabdem_points_sf$fabdem_covered <- fabdem_covered
+
+# Create a lookup table for the points
+fabdem_points_lookup <- 
+  as.data.table(
+    st_drop_geometry(fabdem_points_sf)
+  )
+# This lookup will eventually hold the elevation for every unique urban/source corrdinate pair
+
+# An elev_point_id is only a row number for this run. Do not use an old
+# elev_point_id to match an old elevation to a new candidate list.
+elevation_dir <- here("Data/Processed/FABDEM")
+previous_master <- file.path(
+  elevation_dir,
+  "elevation_points_complete.rds"
+)
+
+# If the whole FABDEM folder was renamed during an earlier rerun, the
+# completed master can also be read from that older folder.
+if (!file.exists(previous_master)) {
+  previous_master <- here(
+    "Data/Processed/FABDEM_previous_candidates/elevation_points_complete.rds"
+  )
+}
+
+cached_elevations <- data.table(
+  point_type = character(),
+  lon = numeric(),
+  lat = numeric(),
+  elevation_m = numeric(),
+  elevation_dataset = character()
+)
+
+if (file.exists(previous_master)) {
+  old <- as.data.table(readRDS(previous_master))
+  needed <- names(cached_elevations)
+  stopifnot(all(needed %in% names(old)))
+
+  old <- old[
+    is.finite(lon) & is.finite(lat) & is.finite(elevation_m) &
+      elevation_dataset %in% c(
+        "FABDEM_V1-2",
+        "COPERNICUS_GLO30_2024_1"
+      ),
+    ..needed
+  ]
+
+  # A single point cannot have two different saved elevations.
+  inconsistent <- old[, .(
+    n_values = uniqueN(elevation_m),
+    n_datasets = uniqueN(elevation_dataset)
+  ), by = .(point_type, lon, lat)][
+    n_values > 1L | n_datasets > 1L
+  ]
+  if (nrow(inconsistent)) {
+    stop("Previous elevation master has conflicting values for a point")
+  }
+
+  cached_elevations <- unique(
+    old,
+    by = c("point_type", "lon", "lat")
+  )
+}
+
+fabdem_points_lookup[, `:=`(
+  cached_elevation_m = NA_real_,
+  cached_elevation_dataset = NA_character_
+)]
+
+fabdem_points_lookup[
+  cached_elevations,
+  on = .(point_type, lon, lat),
+  `:=`(
+    cached_elevation_m = i.elevation_m,
+    cached_elevation_dataset = i.elevation_dataset
+  )
+]
+
+cat(
+  "Points with saved elevation:",
+  sum(is.finite(fabdem_points_lookup$cached_elevation_m)),
+  "/", nrow(fabdem_points_lookup), "\n"
+)
+
+# Match each covered point to its actual FABDEM tile
+covered_points_sf <- fabdem_points_sf[fabdem_covered, ]
+
+tile_match <- st_intersects(
+  covered_points_sf,
+  fabdem_tiles
+)
+
+# Every covered point should intersect at least one tile
+stopifnot(all(lengths(tile_match) >= 1L))
+
+# If a point lies exactly on a tile boundary, use the first matching tile
+tile_idx <- vapply(
+  tile_match,
+  function(x) x[1L],
+  integer(1)
+)
+
+covered_points_sf$tile_name <- fabdem_tiles$tile_name[tile_idx]
+
+covered_points_sf$file_name <- fabdem_tiles$file_name[tile_idx]
+
+covered_points_sf$zipfile_name <- fabdem_tiles$zipfile_name[tile_idx]
+
+
+# Check the attributes
+head(st_drop_geometry(covered_points_sf)[, c("lon", "lat", "tile_name", "file_name", "zipfile_name") ])
+```
+
+
+```{r}
+
+#/*==========================================================*/
+#' ## 1. Prepare covered FABDEM points
+#/*==========================================================*/
+
+# covered_points_sf must already contain:
+# elev_point_id
+# point_type
+# lon
+# lat
+# tile_name
+# file_name
+# zipfile_name
+
+stopifnot(
+  all(
+    c(
+      "elev_point_id",
+      "point_type",
+      "lon",
+      "lat",
+      "tile_name",
+      "file_name",
+      "zipfile_name"
+    ) %in% names(covered_points_sf)
+  )
+)
+
+fabdem_points_covered <-
+  as.data.table(
+    st_drop_geometry(covered_points_sf)
+  )[
+    !elev_point_id %in%
+      fabdem_points_lookup[
+        is.finite(cached_elevation_m),
+        elev_point_id
+      ],
+    .(
+      elev_point_id,
+      point_type,
+      lon,
+      lat,
+      tile_name
+    )
+  ]
+
+
+#/*==========================================================*/
+#' ## 2. Construct required FABDEM tile table
+#/*==========================================================*/
+
+fabdem_required_tiles <-
+  unique(
+    as.data.table(
+      st_drop_geometry(covered_points_sf)
+    )[
+      elev_point_id %in% fabdem_points_covered$elev_point_id,
+      .(
+        tile_name,
+        file_name,
+        zipfile_name
+      )
+    ]
+  )
+
+setorder(
+  fabdem_required_tiles,
+  tile_name
+)
+
+
+#/*==========================================================*/
+#' ## 3. Normalize FABDEM mirror names
+#/*==========================================================*/
+
+# Hugging Face bucket
+fabdem_base_url <-
+  "https://huggingface.co/buckets/links-ads/fabdem/resolve/tiles"
+
+
+# ---- Parent 10-degree folder ---- #
+
+fabdem_required_tiles[
+  ,
+  parent_folder := sub(
+    "\\.zip$",
+    "",
+    zipfile_name
+  )
+]
+
+
+# Fix malformed southern/northern endpoint notation:
+# e.g.
+# S60W070-S-50W060 -> S60W070-S50W060
+
+fabdem_required_tiles[
+  ,
+  parent_folder := gsub(
+    "([NS])-([0-9]{2})",
+    "\\1\\2",
+    parent_folder
+  )
+]
+
+
+# Prime meridian convention:
+# W000 -> E000 when it is the eastern boundary
+
+fabdem_required_tiles[
+  ,
+  parent_folder := sub(
+    "-([NS][0-9]{2})W000_",
+    "-\\1E000_",
+    parent_folder
+  )
+]
+
+
+# Antimeridian convention:
+# E180 -> W180
+
+fabdem_required_tiles[
+  ,
+  parent_folder := sub(
+    "-([NS][0-9]{2})E180_",
+    "-\\1W180_",
+    parent_folder
+  )
+]
+
+
+# ---- Individual 1-degree tile name ---- #
+#
+# Official index:
+# N000E006
+# S055W068
+#
+# Hugging Face mirror:
+# N00E006
+# S55W068
+
+fabdem_required_tiles[,
+  bucket_tile := sub(
+    "^([NS])0([0-9]{2})([EW][0-9]{3})$",
+    "\\1\\2\\3",
+    tile_name
+  )
+]
+
+
+fabdem_required_tiles[,
+  mirror_file := paste0(bucket_tile, "_FABDEM_V1-2.tif") 
+]
+
+# ---- Final URL ---- #
+fabdem_required_tiles[,
+  url := paste0(fabdem_base_url, "/", parent_folder, "/", mirror_file)
+]
+
+
+#/*==========================================================*/
+#' ## 4. Validate naming BEFORE any downloading
+#/*==========================================================*/
+
+# No malformed S-50 / N-50 style endpoints
+stopifnot(
+  !any(
+    grepl(
+      "[NS]-[0-9]{2}",
+      fabdem_required_tiles$parent_folder
+    )
+  )
+)
+
+# No eastern boundary expressed as W000
+stopifnot(
+  !any(
+    grepl(
+      "-[NS][0-9]{2}W000_",
+      fabdem_required_tiles$parent_folder
+    )
+  )
+)
+
+# No eastern boundary expressed as E180
+stopifnot(
+  !any(
+    grepl(
+      "-[NS][0-9]{2}E180_",
+      fabdem_required_tiles$parent_folder
+    )
+  )
+)
+
+
+# Check the specific cases that caused problems earlier
+
+fabdem_required_tiles[
+  tile_name %chin%
+    c(
+      "N004W002",
+      "S055W068"
+    ),
+  .(
+    tile_name,
+    parent_folder,
+    mirror_file,
+    url
+  )
+]
+
+
+#/*==========================================================*/
+#' ## 5. Directories
+#/*==========================================================*/
+
+fabdem_tmp_dir <- "Data/Raw/FABDEM/tmp"
+
+fabdem_output_dir <- "Data/Processed/FABDEM/extracted_tiles"
+
+dir.create(
+  fabdem_tmp_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  fabdem_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+fabdem_required_tiles[, 
+  out_path := file.path(fabdem_output_dir, paste0( tile_name, ".rds"))
+]
+
+# A tile filename alone does not show whether it contains the current
+# points. Old files can have the same name but different elev_point_id values.
+tile_is_complete <- function(k) {
+  path <- fabdem_required_tiles$out_path[k]
+  if (!file.exists(path)) return(FALSE)
+
+  saved <- tryCatch(as.data.table(readRDS(path)), error = function(e) NULL)
+  if (is.null(saved)) return(FALSE)
+
+  required <- fabdem_points_covered[
+    tile_name == fabdem_required_tiles$tile_name[k]
+  ]
+  columns <- c(
+    "elev_point_id", "point_type", "lon", "lat",
+    "elevation_m", "elevation_dataset"
+  )
+  if (!all(columns %in% names(saved))) return(FALSE)
+  if (nrow(saved) != nrow(required)) return(FALSE)
+
+  setorder(saved, elev_point_id)
+  setorder(required, elev_point_id)
+
+  identical(saved$elev_point_id, required$elev_point_id) &&
+    identical(as.character(saved$point_type),
+              as.character(required$point_type)) &&
+    identical(saved$lon, required$lon) &&
+    identical(saved$lat, required$lat) &&
+    isTRUE(all(saved$elevation_dataset == "FABDEM_V1-2"))
+}
+
+
+#/*==========================================================*/
+#' ## 6. Remove stale temporary files from OLD runs
+#/*==========================================================*/
+
+# Run this only when no old FABDEM workers are running.
+
+stale_tmp_files <-
+  list.files(
+    fabdem_tmp_dir,
+    pattern = "\\.tif(\\.part)?$",
+    full.names = TRUE
+  )
+
+if (length(stale_tmp_files) > 0L) {
+  unlink(stale_tmp_files)
+}
+
+
+#/*==========================================================*/
+#' ## 7. Function to process one FABDEM tile
+#/*==========================================================*/
+
+process_fabdem_tile <- function(
+  k,
+  max_download_attempts = 5L
+) {
+
+  tile <-
+    fabdem_required_tiles[k]
+
+  this_tile_name <-
+    tile$tile_name
+
+  out_path <-
+    tile$out_path
+
+  tif_path <-
+    file.path(
+      fabdem_tmp_dir,
+      tile$mirror_file
+    )
+
+  part_path <-
+    paste0(
+      tif_path,
+      ".part"
+    )
+
+  rds_part_path <-
+    paste0(
+      out_path,
+      ".part"
+    )
+
+
+  #--------------------------------#
+  # Skip completed tiles
+  #--------------------------------#
+
+  if (tile_is_complete(k)) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "already_done",
+        error = NA_character_
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Select points in tile
+  #--------------------------------#
+
+  points_tile <-
+    fabdem_points_covered[
+      tile_name == this_tile_name
+    ]
+
+  if (nrow(points_tile) == 0L) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "no_points",
+        error = NA_character_
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Guaranteed temporary cleanup
+  #--------------------------------#
+
+  on.exit(
+    {
+
+      if (file.exists(part_path)) {
+        unlink(part_path)
+      }
+
+      if (file.exists(tif_path)) {
+        unlink(tif_path)
+      }
+
+      if (file.exists(rds_part_path)) {
+        unlink(rds_part_path)
+      }
+
+    },
+    add = TRUE
+  )
+
+
+  # Remove remnants specific to this tile
+
+  if (file.exists(part_path)) {
+    unlink(part_path)
+  }
+
+  if (file.exists(tif_path)) {
+    unlink(tif_path)
+  }
+
+  if (file.exists(rds_part_path)) {
+    unlink(rds_part_path)
+  }
+
+
+  #--------------------------------#
+  # Download with automatic retries
+  #--------------------------------#
+
+  download_success <-
+    FALSE
+
+  last_error <-
+    NA_character_
+
+
+  for (
+    attempt in seq_len(max_download_attempts)
+  ) {
+
+    ok <-
+      tryCatch(
+        {
+
+          download.file(
+            tile$url,
+            destfile = part_path,
+            mode = "wb",
+            method = "libcurl",
+            quiet = TRUE
+          )
+
+          file.exists(part_path) &&
+            !is.na(file.info(part_path)$size) &&
+            file.info(part_path)$size > 0
+
+        },
+        error = function(e) {
+
+          last_error <<-
+            conditionMessage(e)
+
+          FALSE
+        }
+      )
+
+
+    if (isTRUE(ok)) {
+
+      download_success <-
+        TRUE
+
+      break
+    }
+
+
+    if (file.exists(part_path)) {
+      unlink(part_path)
+    }
+
+
+    # Backoff between failed attempts
+
+    Sys.sleep(
+      min(
+        2^(attempt - 1),
+        10
+      ) +
+        runif(
+          1,
+          0,
+          1
+        )
+    )
+  }
+
+
+  if (!download_success) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_download",
+        error = last_error
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Promote completed download
+  #--------------------------------#
+
+  rename_ok <-
+    file.rename(
+      part_path,
+      tif_path
+    )
+
+  if (!rename_ok) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_file_rename",
+        error = "Could not rename .tif.part to .tif"
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Open raster
+  #--------------------------------#
+
+  dem <-
+    tryCatch(
+      terra::rast(
+        tif_path
+      ),
+      error = function(e) e
+    )
+
+
+  if (inherits(dem, "error")) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_raster",
+        error = conditionMessage(dem)
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Point vector
+  #--------------------------------#
+
+  points_vect <-
+    tryCatch(
+      terra::vect(
+        points_tile,
+        geom = c(
+          "lon",
+          "lat"
+        ),
+        crs = "EPSG:4326"
+      ),
+      error = function(e) e
+    )
+
+
+  if (inherits(points_vect, "error")) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_vector",
+        error = conditionMessage(points_vect)
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Extract elevation
+  #--------------------------------#
+
+  elev <-
+    tryCatch(
+      terra::extract(
+        dem,
+        points_vect,
+        method = "bilinear"
+      ),
+      error = function(e) e
+    )
+
+
+  if (inherits(elev, "error")) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_extract",
+        error = conditionMessage(elev)
+      )
+    )
+  }
+
+
+  if (nrow(elev) != nrow(points_tile)) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_extract",
+        error = "Number of extracted values does not match number of points"
+      )
+    )
+  }
+
+
+  #--------------------------------#
+  # Result
+  #--------------------------------#
+
+  result <-
+    copy(
+      points_tile
+    )
+
+  result[
+    ,
+    elevation_m :=
+      elev[[2L]]
+  ]
+
+  result[
+    ,
+    elevation_dataset :=
+      "FABDEM_V1-2"
+  ]
+
+
+  #--------------------------------#
+  # Atomic RDS write
+  #--------------------------------#
+
+  saveRDS(
+    result,
+    rds_part_path,
+    compress = FALSE
+  )
+
+
+  rds_rename_ok <-
+    file.rename(
+      rds_part_path,
+      out_path
+    )
+
+
+  if (!rds_rename_ok) {
+
+    return(
+      data.table(
+        k = k,
+        tile_name = this_tile_name,
+        status = "failed_rds_rename",
+        error = "Could not rename temporary RDS output"
+      )
+    )
+  }
+
+
+  data.table(
+    k = k,
+    tile_name = this_tile_name,
+    status = "success",
+    error = NA_character_
+  )
+}
+
+
+#/*==========================================================*/
+#' ## 8. Run all unfinished tiles automatically
+#/*==========================================================*/
+
+# Catch errors for one tile without stopping all the other workers.
+process_fabdem_tile_safe <- function(k) {
+  tryCatch(
+    process_fabdem_tile(k),
+    error = function(e) {
+      data.table(
+        k = k,
+        tile_name = fabdem_required_tiles$tile_name[k],
+        status = "unexpected_error",
+        error = conditionMessage(e)
+      )
+    }
+  )
+}
+
+run_fabdem_extraction <- function(
+  n_cores = 10L,
+  max_rounds = 4L
+) {
+
+  # PSOCK workers start independent R sessions; they do not fork R on macOS.
+  cl <- parallel::makePSOCKcluster(n_cores)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+
+  parallel::clusterEvalQ(cl, library(data.table))
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "fabdem_required_tiles",
+      "fabdem_points_covered",
+      "fabdem_tmp_dir",
+      "fabdem_output_dir",
+      "tile_is_complete",
+      "process_fabdem_tile",
+      "process_fabdem_tile_safe"
+    ),
+    envir = .GlobalEnv
+  )
+
+  all_status <-
+    vector(
+      "list",
+      max_rounds
+    )
+
+
+  for (
+    round in seq_len(max_rounds)
+  ) {
+
+    completed <- vapply(
+      seq_len(nrow(fabdem_required_tiles)),
+      tile_is_complete,
+      logical(1)
+    )
+
+    tiles_todo <-
+      which(
+        !completed
+      )
+
+
+    if (length(tiles_todo) == 0L) {
+
+      message(
+        "All FABDEM tiles completed."
+      )
+
+      break
+    }
+
+
+    message(
+      sprintf(
+        "Round %d: processing %d unfinished tiles",
+        round,
+        length(tiles_todo)
+      )
+    )
+
+
+    round_status <- parallel::parLapplyLB(
+      cl,
+      tiles_todo,
+      process_fabdem_tile_safe
+    )
+
+
+    round_status <-
+      rbindlist(
+        round_status,
+        use.names = TRUE,
+        fill = TRUE
+      )
+
+
+    round_status[
+      ,
+      round := round
+    ]
+
+
+    all_status[[round]] <-
+      round_status
+
+
+    print(
+      round_status[
+        ,
+        .N,
+        by = status
+      ][
+        order(-N)
+      ]
+    )
+
+
+    # Brief pause before retry round
+
+    if (round < max_rounds) {
+
+      Sys.sleep(5)
+    }
+  }
+
+
+  all_status <-
+    rbindlist(
+      all_status,
+      use.names = TRUE,
+      fill = TRUE
+    )
+
+
+  all_status
+}
+
+
+#/*==========================================================*/
+#' ## 9. Execute
+#/*==========================================================*/
+
+# Four independent workers download and extract different tiles concurrently.
+# Only files containing exactly the requested new points are reused.
+
+fabdem_run_status <- if (nrow(fabdem_required_tiles)) {
+  run_fabdem_extraction(
+    n_cores = 10L,
+    max_rounds = 4L
+  )
+} else {
+  data.table(
+    k = integer(),
+    tile_name = character(),
+    status = character(),
+    error = character(),
+    round = integer()
+  )
+}
+  
+# Save processing log
+
+fwrite(
+  fabdem_run_status,
+  "Data/Processed/FABDEM/fabdem_run_status.csv"
+)
+
+
+#/*==========================================================*/
+#' ## 10. FINAL tile-level validation
+#/*==========================================================*/
+
+fabdem_required_tiles[
+  ,
+  completed := vapply(
+    seq_len(.N),
+    tile_is_complete,
+    logical(1)
+  )
+]
+
+
+missing_tiles <-
+  fabdem_required_tiles[
+    completed == FALSE
+  ]
+
+
+cat(
+  "Required tiles:",
+  nrow(fabdem_required_tiles),
+  "\n"
+)
+
+cat(
+  "Completed tiles:",
+  sum(fabdem_required_tiles$completed),
+  "\n"
+)
+
+cat(
+  "Missing tiles:",
+  nrow(missing_tiles),
+  "\n"
+)
+
+
+if (nrow(missing_tiles) > 0L) {
+
+  fwrite(
+    missing_tiles,
+    "Data/Processed/FABDEM/fabdem_missing_tiles.csv"
+  )
+
+  stop(
+    paste0(
+      nrow(missing_tiles),
+      " FABDEM tiles remain unresolved. ",
+      "See fabdem_missing_tiles.csv."
+    )
+  )
+}
+
+
+#/*==========================================================*/
+#' ## 11. Combine all tile-level elevation results
+#/*==========================================================*/
+
+fabdem_result_files <- fabdem_required_tiles$out_path
+
+
+stopifnot(
+  all(
+    file.exists(
+      fabdem_result_files
+    )
+  )
+)
+
+
+new_fabdem_elevation <- if (length(fabdem_result_files)) {
+  rbindlist(lapply(fabdem_result_files, readRDS), use.names = TRUE)
+} else {
+  data.table(
+    elev_point_id = integer(),
+    point_type = character(),
+    lon = numeric(),
+    lat = numeric(),
+    tile_name = character(),
+    elevation_m = numeric(),
+    elevation_dataset = character()
+  )
+}
+
+reused_fabdem_elevation <- fabdem_points_lookup[
+  fabdem_covered & is.finite(cached_elevation_m) &
+    cached_elevation_dataset == "FABDEM_V1-2",
+  .(
+    elev_point_id,
+    point_type,
+    lon,
+    lat,
+    elevation_m = cached_elevation_m,
+    elevation_dataset = cached_elevation_dataset
+  )
+]
+
+fabdem_elevation <- rbindlist(
+  list(new_fabdem_elevation, reused_fabdem_elevation),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+
+setorder(
+  fabdem_elevation,
+  elev_point_id
+)
+
+
+#/*==========================================================*/
+#' ## 12. FINAL point-level validation
+#/*==========================================================*/
+
+# No duplicate point IDs
+
+duplicate_ids <-
+  fabdem_elevation[,
+    .N,
+    by = elev_point_id
+  ][
+    N > 1L
+  ]
+
+stopifnot(
+  nrow(duplicate_ids) == 0L
+)
+
+
+# Every newly extracted FABDEM point must have an output row.
+missing_point_ids <-
+  setdiff(
+    fabdem_points_covered$elev_point_id,
+    new_fabdem_elevation$elev_point_id
+  )
+
+stopifnot(
+  length(missing_point_ids) == 0L
+)
+
+
+cat(
+  "New FABDEM points:",
+  nrow(fabdem_points_covered),
+  "\n"
+)
+
+cat(
+  "Extracted point records:",
+  nrow(fabdem_elevation),
+  "\n"
+)
+
+cat(
+  "Unique extracted point IDs:",
+  uniqueN(
+    fabdem_elevation$elev_point_id
+  ),
+  "\n"
+)
+
+cat(
+  "NA elevation values:",
+  sum(
+    is.na(
+      fabdem_elevation$elevation_m
+    )
+  ),
+  "\n"
+)
+
+
+#/*==========================================================*/
+#' ## 13. Save completed FABDEM elevation table
+#/*==========================================================*/
+saveRDS(
+  fabdem_elevation,
+  "Data/Processed/FABDEM/fabdem_elevation.rds",
+  compress = FALSE
+)
+```
+
+
+# Work on Copernicus GLO-30
+
+Next, build a complete elevation lookup, fill only the remaining gaps with Copernicus GLO-30, then attach elevations back to uc_2025 and surface_water_candidates.
+
+```{r}
+# /*===========================================*/
+#'=  Build the master elevation table =
+# /*===========================================*/
+fabdem_elevation <- readRDS("Data/Processed/FABDEM/fabdem_elevation.rds")
+
+elevation_points <- copy(
+  fabdem_points_lookup[, .(
+    elev_point_id,
+    point_type,
+    lon,
+    lat,
+    fabdem_covered,
+    elevation_m = cached_elevation_m,
+    elevation_dataset = cached_elevation_dataset
+  )]
+)
+
+elevation_points[
+  fabdem_elevation[, .(
+    elev_point_id,
+    elevation_m,
+    elevation_dataset
+  )],
+  on = "elev_point_id",
+  `:=`(
+    elevation_m = i.elevation_m,
+    elevation_dataset = i.elevation_dataset
+  )
+]
+
+```
+
+
+```{r}
+#/*--------------------------------*/
+#' ## Check what remains missing
+#/*--------------------------------*/
+elevation_points[, .N, by = .(
+  point_type,
+  fabdem_covered,
+  missing_elevation = is.na(elevation_m)
+)]
+
+copdem_points <- elevation_points[
+  is.na(elevation_m)
+]
+
+nrow(copdem_points)
+
+copdem_points[, .N, by = .(
+  point_type,
+  fabdem_covered
+)]
+```
+
+
+
+```{r}
+# /*===========================================*/
+#'=  Extract Copernicus GLO-30 elevations =
+# /*===========================================*/
+copdem_points <- elevation_points[!is.finite(elevation_m)]
+
+if (nrow(copdem_points) > 0L) {
+library(rgee)
+
+# I did
+# conda activate tools
+# conda install -c conda-forge earthengine-api numpy
+
+# Then, restart R session completely because because reticulate cannot reliably switch Python environments after Python has already been initialized.
+# In the new R session, run:
+# library(reticulate)
+
+# use_python(
+#   "/Users/shunkeikakimoto/miniforge3/envs/tools/bin/python3.11",
+#   required = TRUE
+# )
+
+# py_config()
+# py_module_available("ee")
+
+# ee_install_set_pyenv(
+#   py_path = "/Users/shunkeikakimoto/miniforge3/envs/tools/bin/python3.11",
+#   py_env = "tools"
+# )
+
+
+
+ee_Authenticate(
+  auth_mode = "notebook"
+)
+
+ee$Initialize(
+  project = "gep-water-2026"
+)
+
+# Extract only points still missing after reuse and FABDEM.
+
+nrow(copdem_points)
+
+#/*--------------------------------*/
+#' ## load the current Copernicus GLO-30 2024_1 DEM
+#/*--------------------------------*/
+copdem_collection <- ee$ImageCollection(
+  "COPERNICUS/DEM/GLO30_2024_1"
+)
+
+native_projection <- copdem_collection$
+  first()$
+  select("DEM")$
+  projection()
+
+copdem <- copdem_collection$
+  mosaic()$
+  setDefaultProjection(native_projection)$
+  select("DEM")$
+  rename("elevation_m")
+
+
+#/*--------------------------------*/
+#' ## Function to extract one batch
+#/*--------------------------------*/
+extract_copdem_batch <- function(dt) {
+
+  features <- lapply(seq_len(nrow(dt)), function(j) {
+
+    ee$Feature(
+      ee$Geometry$Point(
+        list(
+          dt$lon[j],
+          dt$lat[j]
+        )
+      ),
+      list(
+        elev_point_id = as.character(dt$elev_point_id[j])
+      )
+    )
+  })
+
+  points_fc <- ee$FeatureCollection(
+    features
+  )
+
+  reducer <- ee$Reducer$
+    first()$
+    setOutputs(
+      list("elevation_m")
+    )
+
+  result <- copdem$
+    reduceRegions(
+      collection = points_fc,
+      reducer = reducer,
+      scale = 30
+    )$
+    getInfo()
+
+  rbindlist(
+    lapply(result$features, function(x) {
+
+      p <- x$properties
+
+      data.table(
+        elev_point_id = as.integer(p$elev_point_id),
+        elevation_m = if (is.null(p$elevation_m)) {
+          NA_real_
+        } else {
+          as.numeric(p$elevation_m)
+        }
+      )
+    })
+  )
+}
+
+
+#/*--------------------------------*/
+#' ## Extract all fallback points
+#/*--------------------------------*/
+batch_size <- 200L
+
+copdem_points[, batch_id :=
+  ceiling(.I / batch_size)]
+
+copdem_results <- lapply(
+  split(
+    copdem_points,
+    by = "batch_id",
+    keep.by = FALSE
+  ),
+  extract_copdem_batch
+)
+
+copdem_elevation <- 
+  rbindlist(
+    copdem_results,
+    use.names = TRUE
+  )
+
+setorder(
+  copdem_elevation,
+  elev_point_id
+)
+
+
+# Identify the dataset
+copdem_elevation[, elevation_dataset := "COPERNICUS_GLO30_2024_1"]
+
+# Validate:
+nrow(copdem_elevation)
+
+uniqueN(copdem_elevation$elev_point_id)
+
+copdem_elevation[is.na(elevation_m), .N ]
+
+summary(copdem_elevation$elevation_m)
+
+#/*--------------------------------*/
+#' ## Fill the missing elevations
+#/*--------------------------------*/
+elevation_points[
+  copdem_elevation,
+  on = "elev_point_id",
+  `:=`(
+    elevation_m = i.elevation_m,
+    elevation_dataset = i.elevation_dataset
+  )
+]
+
+} # No Earth Engine session is needed if all elevations were reused.
+
+# Check
+remaining_missing <- elevation_points[!is.finite(elevation_m), .N]
+if (remaining_missing > 0L) {
+  stop(remaining_missing, " requested points still lack elevation")
+}
+
+stopifnot(
+  !anyDuplicated(elevation_points[, .(point_type, lon, lat)]),
+  nrow(elevation_points) == nrow(fabdem_points_lookup)
+)
+
+
+# === Save === #
+saveRDS(
+  elevation_points,
+  "Data/Processed/FABDEM/elevation_points_complete.rds",
+  compress = FALSE
+)
+```

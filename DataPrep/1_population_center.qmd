@@ -1,0 +1,183 @@
+---
+title: "Identify population centers i"
+---
+
+# Data
++ GHS-WUP-MTUC R2025A from the European Commission JRC from the European Commission. It provides more than 10,000 globally harmonized urban centers
+  + https://human-settlement.emergency.copernicus.eu/ghs_wup_mtuc_r2025a.php
+
+# Process
+I define population center $i$ as a GHSL Urban Centre, represented spatially by its population-weighted centroid.
+
+Specifically, I use the Urban Centres identified in the GHS-WUP-MTUC R2025A dataset. An Urban Centre is defined using a globally harmonized Degree of Urbanisation framework rather than country-specific administrative boundaries. It consists of contiguous high-density grid cells with a population density of at least 1,500 persons per km$^2$ and a total population of at least 50,000.
+
+Thus, the 50,000-person threshold is not an additional sample restriction imposed in this analysis; it is inherent in the GHSL definition of an Urban Centre. Using this definition provides a spatially consistent set of population centers across countries and avoids differences in national definitions of cities or municipalities.
+
+For each population center $i$, I represent its location by the population-weighted centroid,
+
+$$
+\mathbf{x}_i =
+(\mathrm{lon}_i^{PW}, \mathrm{lat}_i^{PW}),
+$$
+
+where $\mathrm{lon}_i^{PW}$ and $\mathrm{lat}_i^{PW}$ denote the longitude and latitude of the population-weighted centroid, respectively. This location is used as the representative municipal water-demand point in the subsequent analysis of surface-water access and conveyance costs.
+
+
+```{r}
+
+# /*===========================================*/
+#'=  Downlaod the data (One time) =
+# /*===========================================*/
+
+# Directory
+dir_data <- here("Data/Raw/GHS_WUP_MTUC_R2025A")
+
+dir.create(
+  dir_data,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Download URL
+url_stats <- 
+  paste0(
+    "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL/",
+    "GHS_WUP_MTUC_GLOBE_R2025A/V1-1/",
+    "GHS_WUP_MTUC_GLOBE_R2025A_V1_1_statistics.zip"
+  )
+
+# Local file
+file_zip <- file.path(dir_data, "GHS_WUP_MTUC_GLOBE_R2025A_V1_1_statistics.zip")
+
+download.file(
+  url = url_stats,
+  destfile = file_zip,
+  mode = "wb"
+)
+
+# Unzip the downloaded file
+dir_unzip <- file.path(
+  dir_data,
+  "GHS_WUP_MTUC_GLOBE_R2025A_V1_1_statistics"
+)
+
+dir.create(dir_unzip, showWarnings = FALSE)
+
+unzip(file_zip, exdir = dir_unzip)
+```
+
+
+# Data Preparation
+
+```{r}
+# /*===========================================*/
+#'=  Read the Excel file =
+# /*===========================================*/
+file_xlsx <- 
+  list.files(
+    here("Data/Raw/GHS_WUP_MTUC_R2025A/GHS_WUP_MTUC_GLOBE_R2025A_V1_1_statistics"),
+    pattern = "\\.xlsx$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+# file_xlsx
+
+# Read the data from the Excel file
+uc_raw <- 
+  rio::import(
+    file_xlsx[1], 
+    which = "UC_STATS",
+    setclass = "data.table") %>%
+  as.data.table()
+
+names(uc_raw)
+```
+
+
+```{r}
+# /*===========================================*/
+#'=  Identify the 2025 population centers =
+# /*===========================================*/
+uc_2025 <- 
+  uc_raw[
+    Year == 2025,
+    .(
+      urban_id     = ID_UC_G0,
+      urban_name   = UCname,
+      country_id   = UNLocID,
+      country_name = UNLocName,
+      population   = POP,
+      area_km2     = AREA_km2,
+      lon          = Lon,
+      lat          = Lat,
+      capital      = CapitalFlag,
+      size_class   = size_class_epoch,
+      plausibility = Plausibility
+    )
+  ]
+
+nrow(uc_2025) #12,140
+uniqueN(uc_2025$urban_id) #12,140
+uc_2025[, .N, by = urban_id][N > 1] # So, there are no duplicate urban_id values in the dataset.
+
+saveRDS(uc_2025, here("Data/Processed/ghsl_urban_centres_2025.rds"))
+
+uc_2025_sf <- st_as_sf(
+  uc_2025,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+st_write(
+  uc_2025_sf,
+  here("Data/Processed/ghsl_urban_centers_2025.gpkg")
+)
+
+#/*--------------------------------*/
+#' ## template
+#/*--------------------------------*/
+# uc_2025_template <-
+#   uc_2025[
+#     , .(
+#       urban_id,
+#       urban_name,
+#       country_id,
+#       country_name,
+#       population,
+#       lon, lat
+#     )
+#   ]
+
+# fwrite(
+#   uc_2025_template,
+#   here("Data/Processed/ghsl_urban_centers_2025_template.csv"),
+#   bom = TRUE
+# )
+
+# uc_2025_template[urban_id == 747]
+```
+
+# Plot
+
+```{r}
+uc_2025_sf <- 
+  st_as_sf(
+    uc_2025,
+    coords = c("lon", "lat"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+world_bd <- st_read(here("Data/Raw/boundary/z_ee_r250_correspondence.gpkg")) %>%
+  st_transform(crs = 4326)
+
+ggplot() + 
+  geom_sf(data = world_bd, fill = "gray90", color = "gray50") +
+  geom_sf(data = uc_2025_sf, aes(size = population), color = "blue", alpha = 0.5)
+```
+
+
+
+

@@ -1,0 +1,385 @@
+---
+title: "Country totals for municipal raw-water replacement cost"
+format: html
+execute:
+  echo: true
+---
+
+This script aggregates the **shared-flow-path** replacement results from step 8 by country. It uses the city-to-country identifiers in the prepared groundwater input file. Country cost totals cover only cities with feasible baseline and replacement portfolios. The output retains counts of cities without a value.  No cost is assigned to those cities.
+
+## 1. Read the city results and country identifiers
+
+```{r}
+
+analysis_dir <- here("Data/Analysis")
+result_dir <- here("Data/Results")
+
+if(!dir.exists(result_dir)) {
+  dir.create(result_dir, recursive = TRUE)
+}
+
+scenario_tag <- "30"
+
+# === City-level replacement cost results === #
+city_result <- fread(
+    file.path(
+      analysis_dir,
+      paste0("y_city_shared_flowpath_replacement_", scenario_tag, ".csv")
+    )
+  )
+
+
+# === City-to-Country lookup === #
+uc_2025 <- readRDS(
+    here("Data/Processed/ghsl_urban_centres_2025.rds")
+  )
+
+city_iso3_lookup <- 
+  uc_2025[
+    , iso3 := countrycode::countrycode(country_id, "iso3n", "iso3c")
+  ][
+    , .(
+      iso3,
+      urban_id
+    )
+  ]
+
+stopifnot(!anyDuplicated(city_iso3_lookup$urban_id))
+
+# === Country name template === #
+country_template <- 
+  st_read(
+    here("Data/Raw/Boundary/z_ee_r250_correspondence.gpkg"),
+    quiet = TRUE
+  ) %>%
+  st_drop_geometry() %>%
+  as.data.table() %>%
+  .[
+    , .(
+      iso3_r250_id, 
+      iso3_r250_label,
+      iso3_r250_name
+      )
+  ]
+
+stopifnot(!anyDuplicated(country_template$iso3_r250_id))
+```
+
+# 2. Attach country identifiers to city-level results
+```{r}
+
+required_city_columns <- c(
+  "urban_id",
+  "replacement_status",
+  "demand_m3_year",
+  "baseline_cost_2019usd_year",
+  "replacement_cost_2019usd_year",
+  "extra_cost_2019usd_year",
+  "has_valid_city_electricity_price"
+)
+
+
+city_result <- 
+  merge(
+    city_result[, ..required_city_columns],
+    city_iso3_lookup,
+    by = "urban_id",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+stopifnot(
+  nrow(city_result) == uniqueN(city_result$urban_id),
+  !anyNA(city_result$iso3),
+  !anyNA(city_result$country_name),
+  !anyNA(city_result$country_id),
+  all(nchar(city_result$iso3) == 3L),
+  all(is.finite(city_result$demand_m3_year) & city_result$demand_m3_year > 0)
+)
+
+city_result[,
+  valid_electricity_price :=
+    as.logical(has_valid_city_electricity_price)
+]
+
+stopifnot(!anyNA(city_result$valid_electricity_price))
+```
+
+
+## 3. Aggregate valued cities and report coverage
+
+```{r}
+# Identify cities with a feasible baseline and replacement.
+city_result[
+  , valued := replacement_status == "feasible_replacement"
+]
+
+stopifnot(
+  !anyNA(city_result$iso3),
+  !anyNA(city_result$valued),
+  !anyNA(city_result$valid_electricity_price),
+  all(city_result$replacement_status %in% c(
+    "feasible_replacement",
+    "baseline_uncovered",
+    "no_feasible_replacement"
+  )),
+  all(is.finite(
+    city_result[valued == TRUE]$baseline_cost_2019usd_year
+  )),
+  all(is.finite(
+    city_result[valued == TRUE]$replacement_cost_2019usd_year
+  )),
+  all(is.finite(
+    city_result[valued == TRUE]$extra_cost_2019usd_year
+  ))
+)
+
+# Aggregate city results by ISO3.
+country_results <- city_result[
+  , .(
+    n_cities = .N,
+    n_valued_cities = sum(valued),
+
+    n_baseline_uncovered_missing_price = sum(
+      replacement_status == "baseline_uncovered" &
+        !valid_electricity_price
+    ),
+
+    n_baseline_uncovered_valid_price = sum(
+      replacement_status == "baseline_uncovered" &
+        valid_electricity_price
+    ),
+
+    n_no_feasible_replacement = sum(
+      replacement_status == "no_feasible_replacement"
+    ),
+
+    demand_m3_year_all_cities = sum(demand_m3_year),
+
+    demand_m3_year_valued_cities = sum(
+      demand_m3_year[valued]
+    ),
+
+    baseline_cost_2019usd_year = if (any(valued)) {
+      sum(baseline_cost_2019usd_year[valued])
+    } else {
+      NA_real_
+    },
+
+    replacement_cost_2019usd_year = if (any(valued)) {
+      sum(replacement_cost_2019usd_year[valued])
+    } else {
+      NA_real_
+    },
+
+    replacement_value_2019usd_year = if (any(valued)) {
+      sum(extra_cost_2019usd_year[valued])
+    } else {
+      NA_real_
+    }
+  ),
+  by = iso3
+]
+
+country_results[
+  , `:=`(
+    n_cities_without_value = n_cities - n_valued_cities,
+
+    share_cities_valued = n_valued_cities / n_cities,
+
+    value_coverage = fifelse(
+      n_valued_cities == n_cities,
+      "all_cities_valued",
+      fifelse(
+        n_valued_cities == 0L,
+        "no_cities_valued",
+        "partial"
+      )
+    )
+  )
+]
+
+# Check that the template has one row per ISO3 and contains
+# every ISO3 represented in the city results.
+stopifnot(
+  !anyDuplicated(country_template$iso3_r250_label)
+)
+
+unmatched_iso3 <- setdiff(
+  country_results$iso3,
+  country_template$iso3_r250_label
+)
+
+if (length(unmatched_iso3) > 0L) {
+  stop(
+    "Country results absent from the template: ",
+    paste(unmatched_iso3, collapse = ", ")
+  )
+}
+
+# Retain every template country, including those with no
+# city in the analyzed sample.
+country_results_final <- merge(
+  country_template,
+  country_results,
+  by.x = "iso3_r250_label",
+  by.y = "iso3",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+stopifnot(
+  nrow(country_results_final) == nrow(country_template)
+)
+
+# Explain why a country has no reported replacement value.
+country_results_final[
+  , missing_value_reason := fcase(
+    is.na(n_cities),
+    "no_city_in_analyzed_sample",
+
+    n_valued_cities > 0,
+    NA_character_,
+
+    n_baseline_uncovered_missing_price == n_cities,
+    "all_cities_baseline_uncovered_missing_electricity_price",
+
+    n_baseline_uncovered_valid_price == n_cities,
+    "all_cities_baseline_uncovered_valid_electricity_price",
+
+    n_no_feasible_replacement == n_cities,
+    "all_cities_no_feasible_replacement",
+
+    default = "multiple_reasons_no_valued_cities"
+  )
+]
+
+setcolorder(
+  country_results_final,
+  c(
+    "iso3_r250_id",
+    "iso3_r250_label",
+    "iso3_r250_name",
+    "n_cities",
+    "n_valued_cities",
+    "n_cities_without_value",
+    "share_cities_valued",
+    "value_coverage",
+    "missing_value_reason",
+    "n_baseline_uncovered_missing_price",
+    "n_baseline_uncovered_valid_price",
+    "n_no_feasible_replacement",
+    "demand_m3_year_all_cities",
+    "demand_m3_year_valued_cities",
+    "baseline_cost_2019usd_year",
+    "replacement_cost_2019usd_year",
+    "replacement_value_2019usd_year"
+  )
+)
+
+setorder(
+  country_results_final,
+  iso3_r250_id
+)
+
+# Validate totals using only countries with analyzed cities.
+countries_with_cities <- 
+  country_results_final[!is.na(n_cities) ]
+
+
+stopifnot(
+  sum(countries_with_cities$n_cities) ==
+    nrow(city_result),
+
+  sum(countries_with_cities$n_valued_cities) ==
+    sum(city_result$valued),
+
+  all(
+    countries_with_cities$n_cities_without_value ==
+      countries_with_cities$n_baseline_uncovered_missing_price +
+      countries_with_cities$n_baseline_uncovered_valid_price +
+      countries_with_cities$n_no_feasible_replacement
+  ),
+
+  isTRUE(all.equal(
+    sum(
+      countries_with_cities$replacement_value_2019usd_year,
+      na.rm = TRUE
+    ),
+    sum(
+      city_result[
+        valued == TRUE,
+        extra_cost_2019usd_year
+      ]
+    ),
+    tolerance = 1e-10
+  ))
+)
+```
+
+## 4. Save the country results
+
+```{r}
+output_file <- file.path(
+  result_dir,
+  paste0("y_country_municipal_replacement_cost_", scenario_tag, ".csv")
+)
+
+fwrite(country_results_final, output_file)
+
+# Number of countries by coverage and missing-value reason
+print(
+  country_results_final[
+    , .N,
+    by = .(value_coverage, missing_value_reason)
+  ]
+)
+
+# Overall totals; the monetary total covers valued cities only
+print(
+  country_results_final[
+    , .(
+      template_countries = .N,
+      countries_with_analyzed_cities = sum(!is.na(n_cities)),
+      countries_with_reported_value = sum(
+        !is.na(replacement_value_2019usd_year)
+      ),
+      analyzed_cities = sum(n_cities, na.rm = TRUE),
+      valued_cities = sum(n_valued_cities, na.rm = TRUE),
+      replacement_value_2019usd_year = sum(
+        replacement_value_2019usd_year,
+        na.rm = TRUE
+      )
+    )
+  ]
+)
+
+message("Saved ", output_file)
+```
+
+
+## 5. For final report table
+
+We only need iso3_r250_id, iso3_r250_label, iso3_r250_name, and wateruse_municipal_gep.
+
+```{r}
+final_gep_report <- 
+  country_results_final[
+    , .(
+      iso3_r250_id,
+      iso3_r250_label,
+      iso3_r250_name,
+      wateruse_municipal_gep = replacement_value_2019usd_year 
+    )
+  ]
+
+fwrite(
+  final_gep_report,
+  file.path(
+    result_dir,
+    "wateruse_municipal_gep.csv"
+  )
+)
+
+sum(final_gep_report$wateruse_municipal_gep, na.rm = TRUE)
+```
