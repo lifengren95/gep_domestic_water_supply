@@ -21,8 +21,29 @@ if (!requireNamespace("highs", quietly = TRUE)) {
   stop("Install the highs R package before running this file")
 }
 
-analysis_dir <- here("Data/Analysis")
+analysis_dir_env <- Sys.getenv("MUNI_ANALYSIS_DIR", unset = "")
+analysis_dir <- if (nzchar(analysis_dir_env)) {
+  normalizePath(analysis_dir_env, mustWork = TRUE)
+} else {
+  here::here("Data", "Analysis")
+}
+
+processed_dir <- file.path(dirname(analysis_dir), "Processed")
 scenario_tag <- "30"
+discount_rate <- suppressWarnings(as.numeric(
+  Sys.getenv("MUNI_DISCOUNT_RATE", unset = "0.02")
+))
+
+if (
+  length(discount_rate) != 1L ||
+  !is.finite(discount_rate) ||
+  !any(abs(discount_rate - c(0.01, 0.02, 0.03)) < 1e-10)
+) {
+  stop("MUNI_DISCOUNT_RATE must be 0.01, 0.02, or 0.03")
+}
+
+discount_tag <- sprintf("dr%02d", round(100 * discount_rate))
+scenario_dir <- file.path(analysis_dir, discount_tag)
 gw_scenario <- "0.3PD_0.25DL_0.2RR"
 seconds_per_year <- 365.25 * 24 * 60 * 60
 
@@ -40,7 +61,8 @@ output_tag <- if (replacement_scope == "shared_flow_path") {
 }
 
 option_file <- file.path(
-  analysis_dir, "city_surface_water_capacity_options.csv"
+  analysis_dir,
+  paste0("city_surface_water_capacity_options_", discount_tag, ".csv")
 )
 
 conflict_file <- file.path(
@@ -48,20 +70,21 @@ conflict_file <- file.path(
 )
 
 groundwater_file <- file.path(
-  analysis_dir, "ghsl_cities_gw_cost_compressed_20260921.csv"
+  analysis_dir, "ghsl_cities_gw_cost_compressed_2pcdr_20261006.csv"
 )
 
-price_file <- here(
-  "Data/Processed/uc_2025_with_electricity_price.rds"
+price_file <- file.path(
+  processed_dir,
+  "uc_2025_with_electricity_price.rds"
 )
 
 city_file <- file.path(
-  analysis_dir,
+  scenario_dir,
   paste0("x_city_municipal_water_supply_", scenario_tag, ".csv")
 )
 
 chosen_file <- file.path(
-  analysis_dir,
+  scenario_dir,
   paste0("x_city_surface_water_chosen_designs_", scenario_tag, ".csv")
 )
 
@@ -82,7 +105,13 @@ conflicts <- as.data.table(readRDS(conflict_file))
 city <- fread(city_file)
 chosen <- fread(chosen_file)
 
-gw_cost_col <- paste0("gw_unit_cost_2019_usd_m3_", gw_scenario)
+gw_cost_col <- paste0(
+  "gw_unit_cost_2019_usd_m3_",
+  gw_scenario,
+  "_",
+  round(100 * discount_rate),
+  "pcdr"
+)
 gw_capacity_col <- paste0("gw_capacity_m3_year_", gw_scenario)
 
 groundwater <- fread(
@@ -101,6 +130,7 @@ required_options <- c(
   "source_id", "max_delivery_m3_year",
   "source_capacity_m3_year", "fixed_cost_2019usd_year",
   "variable_cost_2019usd_m3", "withdrawal_fraction",
+  "discount_rate",
   "capacity_flow_basis", "source_discharge_m3s"
 )
 required_city <- c(
@@ -125,6 +155,8 @@ stopifnot(
   all(city$status %in% c("covered", "uncovered")),
   all(is.finite(city$demand_m3_year) & city$demand_m3_year > 0),
   uniqueN(options$withdrawal_fraction) == 1L,
+  uniqueN(options$discount_rate) == 1L,
+  isTRUE(all.equal(unique(options$discount_rate), discount_rate)),
   abs(unique(options$withdrawal_fraction) - 0.30) < 1e-8,
   all(abs(city$withdrawal_fraction - 0.30) < 1e-8),
   uniqueN(options$capacity_flow_basis) == 1L,
@@ -168,10 +200,7 @@ retry_control <- highs::highs_control(
 
 ## 2. Build the same supply problem as step 7
 
-Continuous variables represent delivered water as shares of city demand.
-Binary variables choose at most one pipe design per source. A connection
-cannot deliver more than its design permits. Network conflicts and the
-groundwater capacity are retained. Only the available source set changes.
+Continuous variables represent delivered water as shares of city demand.  Binary variables choose at most one pipe design per source. A connection cannot deliver more than its design permits. Network conflicts and the groundwater capacity are retained. Only the available source set changes.
 
 ```{r}
 make_city_model <- function(
@@ -319,10 +348,7 @@ solve_city_model <- function(
 
 ## 3. Remove selected sources and shared-flow alternatives
 
-The saved step 7 portfolio is the baseline. Before excluding its sources,
-the script rebuilds its annual cost from the current pipe options and
-groundwater data. A disagreement stops the run rather than comparing
-different versions of the model.
+The saved step 7 portfolio is the baseline. Before excluding its sources, the script rebuilds its annual cost from the current pipe options and groundwater data. A disagreement stops the run rather than comparing different versions of the model.
 
 ```{r}
 city_parts <- vector("list", nrow(city))
@@ -611,10 +637,7 @@ for (i in seq_len(nrow(city))) {
 
 ## 4. Check and save the results
 
-`extra_cost_2019usd_year` is defined only where the remaining sources meet
-the entire city demand. The source output identifies replacement connections.
-The excluded-source output identifies each selected source and its direct
-shared-flow conflicts. A shortage never receives a monetary value.
+`extra_cost_2019usd_year` is defined only where the remaining sources meet the entire city demand. The source output identifies replacement connections.  The excluded-source output identifies each selected source and its direct shared-flow conflicts. A shortage never receives a monetary value.
 
 ```{r}
 city_results <- rbindlist(city_parts, use.names = TRUE)
@@ -749,7 +772,7 @@ stopifnot(
 fwrite(
   city_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("y_city_", output_tag, "_replacement_", scenario_tag, ".csv")
   )
 )
@@ -757,7 +780,7 @@ fwrite(
 fwrite(
   source_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     if (replacement_scope == "selected_candidate") {
       paste0("y_city_replacement_sources_", scenario_tag, ".csv")
     } else {
@@ -770,7 +793,7 @@ fwrite(
 fwrite(
   excluded_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("y_city_", output_tag, "_excluded_sources_", scenario_tag, ".csv")
   )
 )

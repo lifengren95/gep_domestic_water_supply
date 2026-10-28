@@ -5,7 +5,7 @@ execute:
   echo: true
 ---
 
-This step calculates a cost function for every shortlisted city–source pair.  It does not select a source or combine sources for a city. Run it after `5_2_elevation_difference.qmd`.
+This step calculates a cost function for every shortlisted city–source pair. Run it after `5_2_elevation_difference.qmd`. A single run writes separate cost-option files using 1%, 2%, and 3% annual discount rates. The 2% case is the main specification.
 
 For a selected source and pipe design, the annual cost of delivering $q$ cubic
 meters is
@@ -16,7 +16,8 @@ $$
 
 Here $F$ is annualized construction plus maintenance, and $v$ is pumping electricity per cubic meter. A source that is not built costs zero. The later city optimization selects at most one design per source, can use multiple distinct sources, and applies `surface_water_conflicts.rds` there. This file does not read the conflict or network-matches files.
 
-The modeled source capacity is 30% of RiverATLAS/LakeATLAS mean annual naturalized flow, converted to an annual volume. This is an assumed annual withdrawal scenario, not an observed entitlement or a guaranteed dry-season yield. Step 4_1 screens the broad river candidates using mean annual flow.  Step 4_2 also uses lowest-month flow to add a complementary set of reaches to the shortlist; it does not remove mean-flow-selected reaches. Lowest-month flow is retained for audit but does not set capacity in this step. For a lake, mean outlet flow is used as a renewable-flow proxy. Reservoir storage is not converted to an annual yield because volume alone does not establish refill rates or operating rules.  Capacities are specified separately for each city and do not account for competition between cities.
+The modeled source capacity is 30% of RiverATLAS/LakeATLAS mean annual naturalized flow, converted to an annual volume. This is an assumed annual withdrawal scenario, not an observed entitlement or a guaranteed dry-season yield. Step 4_1 screens the broad river candidates using mean annual flow. Step 4_2 also uses lowest-month flow to add a complementary set of reaches to the shortlist; it does not remove mean-flow-selected reaches. Lowest-month flow is retained for audit but does not set capacity in this step. For a lake, mean outlet flow is used as a renewable-flow proxy. Reservoir storage is not converted to an annual yield because volume alone does not establish refill rates or operating rules. Capacities are specified separately for each city and do not account for
+competition between cities.
 
 ## 1. Set paths and assumptions
 
@@ -33,9 +34,7 @@ demand_file <- here(
     "Data/Analysis/ghsl_urban_centres_2019_with_muni_demand.csv"
   )
 
-output_file <- here(
-  "Data/Analysis/city_surface_water_capacity_options.csv"
-)
+analysis_dir <- here("Data/Analysis")
 
 input_files <- c(candidate_file, price_file, demand_file)
 if (!all(file.exists(input_files))) {
@@ -51,11 +50,14 @@ design_shares <- c(0.25, 0.50, 0.75, 1.00)
 # Keep the available pipe designs identical in the 10% and 30% scenarios.
 # These are sizing references, not withdrawal permissions.
 reference_capacity_fractions <- c(0.10, 0.30)
-discount_rate <- 0.03
+discount_rates <- c(0.01, 0.02, 0.03)
+discount_tags <- sprintf("dr%02d", round(100 * discount_rates))
 
 stopifnot(
   withdrawal_fraction > 0,
   withdrawal_fraction <= 1,
+  all(is.finite(discount_rates) & discount_rates > 0),
+  !anyDuplicated(discount_tags),
   all(design_shares > 0 & design_shares <= 1),
   all(reference_capacity_fractions > 0 &
         reference_capacity_fractions <= 1)
@@ -292,7 +294,7 @@ stopifnot(
 
 ## 5. Calculate annual fixed and variable costs
 
-Fixed cost includes annualized pipeline, intake, and pump-station construction, plus their annual maintenance. Variable cost includes pumping electricity. Costs are in 2019 USD. No city source is chosen in this step.
+Pipeline, intake, and pump-station construction costs, maintenance, and pumping electricity are calculated once for each design. The next section annualizes construction at each discount rate and writes separate options files. Costs are in 2019 USD. No city source is chosen in this step.
 
 ```{r}
 epa_pipe_cost <- data.table(
@@ -336,20 +338,9 @@ options[, pump_capex_2019usd := fifelse(
   0
 )]
 
-options[, annualized_capex_2019usd_year :=
-  (pipeline_capex_2019usd + intake_capex_2019usd) *
-    capital_recovery_factor(discount_rate, 50) +
-  pump_capex_2019usd *
-    capital_recovery_factor(discount_rate, 25)
-]
-
 options[, maintenance_cost_2019usd_year :=
   0.01 * (pipeline_capex_2019usd + intake_capex_2019usd) +
     0.02 * pump_capex_2019usd
-]
-
-options[, fixed_cost_2019usd_year :=
-  annualized_capex_2019usd_year + maintenance_cost_2019usd_year
 ]
 
 options[, variable_cost_2019usd_m3 :=
@@ -358,8 +349,11 @@ options[, variable_cost_2019usd_m3 :=
 ]
 
 stopifnot(
-  all(is.finite(options$fixed_cost_2019usd_year)),
-  all(options$fixed_cost_2019usd_year >= 0),
+  all(is.finite(options$pipeline_capex_2019usd)),
+  all(is.finite(options$intake_capex_2019usd)),
+  all(is.finite(options$pump_capex_2019usd)),
+  all(is.finite(options$maintenance_cost_2019usd_year)),
+  all(options$maintenance_cost_2019usd_year >= 0),
   all(is.finite(options$variable_cost_2019usd_m3)),
   all(options$variable_cost_2019usd_m3 >= 0)
 )
@@ -367,7 +361,13 @@ stopifnot(
 
 ## 6. Save and check cost options
 
-The output is **one row per city, source, and pipe design**. The available volume for that row is `max_delivery_m3_year`. Costs at any positive delivered volume $q$ up to that limit equal `fixed_cost_2019usd_year` plus `variable_cost_2019usd_m3 * q`. These rows are inputs to the city cost minimization step, not one selected price per city.
+Each output is **one row per city, source, and pipe design**. The available
+volume for that row is `max_delivery_m3_year`. Costs at any positive delivered
+volume $q$ up to that limit equal `fixed_cost_2019usd_year` plus
+`variable_cost_2019usd_m3 * q`. These rows are inputs to the city cost
+minimization step, not one selected price per city. Each file differs only in
+its annualized construction cost and resulting fixed annual cost. The 1%, 2%,
+and 3% files are named with `dr01`, `dr02`, and `dr03`, respectively.
 
 ```{r}
 output_columns <- c(
@@ -379,6 +379,7 @@ output_columns <- c(
   "design_capacity_m3_year", "max_delivery_m3_year",
   "n_parallel_pipes", "pipe_diameter_m",
   "friction_head_m", "design_pumping_head_m",
+  "discount_rate",
   "annualized_capex_2019usd_year",
   "maintenance_cost_2019usd_year",
   "fixed_cost_2019usd_year", "variable_cost_2019usd_m3"
@@ -387,18 +388,46 @@ output_columns <- c(
 options[, withdrawal_fraction := withdrawal_fraction]
 options[, capacity_flow_basis := "mean_annual_naturalized_discharge"]
 
-dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
-fwrite(options[, ..output_columns], output_file)
+dir.create(analysis_dir, recursive = TRUE, showWarnings = FALSE)
 
-print(options[, .(
-  cities = uniqueN(urban_id),
-  sources = uniqueN(paste(urban_id, source_key)),
-  design_options = .N,
-  median_fixed_cost_2019usd_year =
-    median(fixed_cost_2019usd_year),
-  median_variable_cost_2019usd_m3 =
-    median(variable_cost_2019usd_m3)
-), by = source_type])
+for (i in seq_along(discount_rates)) {
+  rate <- discount_rates[i]
+  discount_tag <- discount_tags[i]
 
-cat("Saved:", output_file, "\n")
+  options[, annualized_capex_2019usd_year :=
+    (pipeline_capex_2019usd + intake_capex_2019usd) *
+      capital_recovery_factor(rate, 50) +
+    pump_capex_2019usd *
+      capital_recovery_factor(rate, 25)
+  ]
+
+  options[, fixed_cost_2019usd_year :=
+    annualized_capex_2019usd_year + maintenance_cost_2019usd_year
+  ]
+
+  options[, discount_rate := rate]
+
+  stopifnot(
+    all(is.finite(options$annualized_capex_2019usd_year)),
+    all(is.finite(options$fixed_cost_2019usd_year)),
+    all(options$fixed_cost_2019usd_year >= 0)
+  )
+
+  output_file <- file.path(
+    analysis_dir,
+    paste0("city_surface_water_capacity_options_", discount_tag, ".csv")
+  )
+
+  fwrite(options[, ..output_columns], output_file)
+
+  print(options[, .(
+    cities = uniqueN(urban_id),
+    sources = uniqueN(paste(urban_id, source_key)),
+    design_options = .N,
+    median_fixed_cost_2019usd_year = median(fixed_cost_2019usd_year),
+    median_variable_cost_2019usd_m3 = median(variable_cost_2019usd_m3)
+  ), by = source_type])
+
+  message("Saved ", discount_tag, ": ", output_file)
+}
 ```

@@ -5,7 +5,7 @@ execute:
   echo: true
 ---
 
-This script aggregates the **shared-flow-path** replacement results from step 8 by country. It uses the city-to-country identifiers in the prepared groundwater input file. Country cost totals cover only cities with feasible baseline and replacement portfolios. The output retains counts of cities without a value.  No cost is assigned to those cities.
+This script aggregates the **shared-flow-path** replacement results from step 8 by country for 1%, 2%, and 3% discount rates. The 2% scenario is the main result. Country cost totals cover only cities with feasible baseline and replacement portfolios. The output retains counts of cities without a value. No cost is assigned to those cities.
 
 ## 1. Read the city results and country identifiers
 
@@ -19,14 +19,24 @@ if(!dir.exists(result_dir)) {
 }
 
 scenario_tag <- "30"
+discount_tags <- c("dr01", "dr02", "dr03")
 
 # === City-level replacement cost results === #
-city_result <- fread(
-    file.path(
-      analysis_dir,
-      paste0("y_city_shared_flowpath_replacement_", scenario_tag, ".csv")
-    )
+city_result <- rbindlist(lapply(discount_tags, function(discount_tag) {
+  input_file <- file.path(
+    analysis_dir,
+    discount_tag,
+    paste0("y_city_shared_flowpath_replacement_", scenario_tag, ".csv")
   )
+
+  if (!file.exists(input_file)) {
+    stop("Missing replacement results: ", input_file)
+  }
+
+  result <- fread(input_file)
+  result[, discount_tag := discount_tag]
+  result
+}), use.names = TRUE)
 
 
 # === City-to-Country lookup === #
@@ -75,7 +85,8 @@ required_city_columns <- c(
   "baseline_cost_2019usd_year",
   "replacement_cost_2019usd_year",
   "extra_cost_2019usd_year",
-  "has_valid_city_electricity_price"
+  "has_valid_city_electricity_price",
+  "discount_tag"
 )
 
 
@@ -89,10 +100,9 @@ city_result <-
   )
 
 stopifnot(
-  nrow(city_result) == uniqueN(city_result$urban_id),
+  nrow(city_result) == uniqueN(city_result, by = c("discount_tag", "urban_id")),
+  all(discount_tags %in% city_result$discount_tag),
   !anyNA(city_result$iso3),
-  !anyNA(city_result$country_name),
-  !anyNA(city_result$country_id),
   all(nchar(city_result$iso3) == 3L),
   all(is.finite(city_result$demand_m3_year) & city_result$demand_m3_year > 0)
 )
@@ -178,7 +188,7 @@ country_results <- city_result[
       NA_real_
     }
   ),
-  by = iso3
+  by = .(discount_tag, iso3)
 ]
 
 country_results[
@@ -217,19 +227,32 @@ if (length(unmatched_iso3) > 0L) {
   )
 }
 
-# Retain every template country, including those with no
-# city in the analyzed sample.
-country_results_final <- merge(
+# Retain every template country for every discount rate, including
+# those with no city in the analyzed sample.
+scenario_template <- CJ(
+  discount_tag = discount_tags,
+  iso3_r250_label = country_template$iso3_r250_label
+)
+
+scenario_template <- merge(
+  scenario_template,
   country_template,
+  by = "iso3_r250_label",
+  sort = FALSE
+)
+
+country_results_final <- merge(
+  scenario_template,
   country_results,
-  by.x = "iso3_r250_label",
-  by.y = "iso3",
+  by.x = c("discount_tag", "iso3_r250_label"),
+  by.y = c("discount_tag", "iso3"),
   all.x = TRUE,
   sort = FALSE
 )
 
 stopifnot(
-  nrow(country_results_final) == nrow(country_template)
+  nrow(country_results_final) ==
+    length(discount_tags) * nrow(country_template)
 )
 
 # Explain why a country has no reported replacement value.
@@ -257,6 +280,7 @@ country_results_final[
 setcolorder(
   country_results_final,
   c(
+    "discount_tag",
     "iso3_r250_id",
     "iso3_r250_label",
     "iso3_r250_name",
@@ -279,59 +303,57 @@ setcolorder(
 
 setorder(
   country_results_final,
+  discount_tag,
   iso3_r250_id
 )
 
-# Validate totals using only countries with analyzed cities.
-countries_with_cities <- 
-  country_results_final[!is.na(n_cities) ]
+# Check each rate separately so a missing scenario cannot be
+# hidden by totals from the other two rates.
+for (tag in discount_tags) {
+  cities <- city_result[discount_tag == tag]
+  countries <- country_results_final[
+    discount_tag == tag & !is.na(n_cities)
+  ]
 
-
-stopifnot(
-  sum(countries_with_cities$n_cities) ==
-    nrow(city_result),
-
-  sum(countries_with_cities$n_valued_cities) ==
-    sum(city_result$valued),
-
-  all(
-    countries_with_cities$n_cities_without_value ==
-      countries_with_cities$n_baseline_uncovered_missing_price +
-      countries_with_cities$n_baseline_uncovered_valid_price +
-      countries_with_cities$n_no_feasible_replacement
-  ),
-
-  isTRUE(all.equal(
-    sum(
-      countries_with_cities$replacement_value_2019usd_year,
-      na.rm = TRUE
+  stopifnot(
+    sum(countries$n_cities) == nrow(cities),
+    sum(countries$n_valued_cities) == sum(cities$valued),
+    all(
+      countries$n_cities_without_value ==
+        countries$n_baseline_uncovered_missing_price +
+        countries$n_baseline_uncovered_valid_price +
+        countries$n_no_feasible_replacement
     ),
-    sum(
-      city_result[
-        valued == TRUE,
-        extra_cost_2019usd_year
-      ]
-    ),
-    tolerance = 1e-10
-  ))
-)
+    isTRUE(all.equal(
+      sum(countries$replacement_value_2019usd_year, na.rm = TRUE),
+      sum(cities[valued == TRUE, extra_cost_2019usd_year]),
+      tolerance = 1e-10
+    ))
+  )
+}
 ```
 
 ## 4. Save the country results
 
 ```{r}
-output_file <- file.path(
-  result_dir,
-  paste0("y_country_municipal_replacement_cost_", scenario_tag, ".csv")
-)
+for (tag in discount_tags) {
+  scenario_result_dir <- file.path(result_dir, tag)
+  dir.create(scenario_result_dir, recursive = TRUE, showWarnings = FALSE)
 
-fwrite(country_results_final, output_file)
+  output_file <- file.path(
+    scenario_result_dir,
+    paste0("y_country_municipal_replacement_cost_", scenario_tag, ".csv")
+  )
+
+  fwrite(country_results_final[discount_tag == tag], output_file)
+  message("Saved ", output_file)
+}
 
 # Number of countries by coverage and missing-value reason
 print(
   country_results_final[
     , .N,
-    by = .(value_coverage, missing_value_reason)
+    by = .(discount_tag, value_coverage, missing_value_reason)
   ]
 )
 
@@ -350,36 +372,81 @@ print(
         replacement_value_2019usd_year,
         na.rm = TRUE
       )
-    )
+    ),
+    by = discount_tag
   ]
 )
 
-message("Saved ", output_file)
 ```
 
 
 ## 5. For final report table
 
-We only need iso3_r250_id, iso3_r250_label, iso3_r250_name, and wateruse_municipal_gep.
+The 2% file is the main report result. 
 
 ```{r}
-final_gep_report <- 
+for (tag in discount_tags) {
+  final_gep_report <- 
+    country_results_final[
+      discount_tag == tag,
+      .(
+        iso3_r250_id,
+        iso3_r250_label,
+        iso3_r250_name,
+        wateruse_municipal_gep = replacement_value_2019usd_year 
+      )
+    ]
+
+  output_file <- file.path(result_dir, tag, "wateruse_municipal_gep.csv")
+
+  fwrite(final_gep_report, output_file)
+
+  message(
+    tag, ": ",
+    sum(final_gep_report$wateruse_municipal_gep, na.rm = TRUE),
+    " 2019 USD/year; saved ", output_file
+  )
+}
+
+
+
+## Detailed final GEP report for the 2% discount-rate run
+# missing_value_reason is added
+final_gep_report_detailed <- 
   country_results_final[
-    , .(
+    discount_tag == "dr02",
+    .(
       iso3_r250_id,
       iso3_r250_label,
       iso3_r250_name,
-      wateruse_municipal_gep = replacement_value_2019usd_year 
+      wateruse_municipal_gep = replacement_value_2019usd_year,
+      missing_value_reason
     )
   ]
 
 fwrite(
-  final_gep_report,
-  file.path(
-    result_dir,
-    "wateruse_municipal_gep.csv"
+  final_gep_report_detailed,
+  here("Data/Results/dr02/wateruse_municipal_gep_detailed.csv")
   )
-)
+```
 
-sum(final_gep_report$wateruse_municipal_gep, na.rm = TRUE)
+
+
+
+
+
+
+# Check
+
+
+```{r}
+y_country_replacement_cost_dr02 <- 
+  fread(
+    here("Data/Results/dr02/y_country_municipal_replacement_cost_30.csv")
+  )
+
+final_gep_report_dr02 <- 
+  fread(
+    here("Data/Results/dr02/wateruse_municipal_gep.csv")
+  )
 ```

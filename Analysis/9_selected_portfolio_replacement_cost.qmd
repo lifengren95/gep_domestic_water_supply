@@ -5,7 +5,7 @@ execute:
   echo: true
 ---
 
-This analysis starts with the **covered** city-level solutions saved by `7_city_water_cost_min.qmd`. For each city, it removes every surface-water source selected in step 8. If the city used groundwater, it also removes its groundwater option. It then finds the lowest-cost way to meet the *same* annual demand from the **remaining priced sources**.
+This analysis starts with the **covered** city-level solutions saved by `7_city_water_cost_min.qmd`. For each city, it removes every surface-water source selected in step 7. If the city used groundwater, it also removes its groundwater option. It then finds the lowest-cost way to meet the *same* annual demand from the **remaining priced sources**.
 
 Here a "source" means a shortlisted river reach or lake candidate ID.  Another intake on the same river may remain available. The cost difference therefore concerns the selected *candidate connections*, not necessarily loss of access to an entire river system.
 
@@ -21,13 +21,35 @@ if (!requireNamespace("highs", quietly = TRUE)) {
   stop("Install the highs R package before running this file")
 }
 
-analysis_dir <- here("Data/Analysis")
+analysis_dir_env <- Sys.getenv("MUNI_ANALYSIS_DIR", unset = "")
+analysis_dir <- if (nzchar(analysis_dir_env)) {
+  normalizePath(analysis_dir_env, mustWork = TRUE)
+} else {
+  here::here("Data", "Analysis")
+}
+
+processed_dir <- file.path(dirname(analysis_dir), "Processed")
 scenario_tag <- "30"
+discount_rate <- suppressWarnings(as.numeric(
+  Sys.getenv("MUNI_DISCOUNT_RATE", unset = "0.02")
+))
+
+if (
+  length(discount_rate) != 1L ||
+  !is.finite(discount_rate) ||
+  !any(abs(discount_rate - c(0.01, 0.02, 0.03)) < 1e-10)
+) {
+  stop("MUNI_DISCOUNT_RATE must be 0.01, 0.02, or 0.03")
+}
+
+discount_tag <- sprintf("dr%02d", round(100 * discount_rate))
+scenario_dir <- file.path(analysis_dir, discount_tag)
 gw_scenario <- "0.3PD_0.25DL_0.2RR"
 seconds_per_year <- 365.25 * 24 * 60 * 60
 
 option_file <- file.path(
-  analysis_dir, "city_surface_water_capacity_options.csv"
+  analysis_dir,
+  paste0("city_surface_water_capacity_options_", discount_tag, ".csv")
 )
 
 conflict_file <- file.path(
@@ -35,20 +57,21 @@ conflict_file <- file.path(
 )
 
 groundwater_file <- file.path(
-  analysis_dir, "ghsl_cities_gw_cost_compressed_20260921.csv"
+  analysis_dir, "ghsl_cities_gw_cost_compressed_2pcdr_20261006.csv"
 )
 
-price_file <- here(
-  "Data/Processed/uc_2025_with_electricity_price.rds"
+price_file <- file.path(
+  processed_dir,
+  "uc_2025_with_electricity_price.rds"
 )
 
 city_file <- file.path(
-  analysis_dir,
+  scenario_dir,
   paste0("x_city_municipal_water_supply_", scenario_tag, ".csv")
 )
 
 chosen_file <- file.path(
-  analysis_dir,
+  scenario_dir,
   paste0("x_city_surface_water_chosen_designs_", scenario_tag, ".csv")
 )
 
@@ -69,7 +92,13 @@ conflicts <- as.data.table(readRDS(conflict_file))
 city <- fread(city_file)
 chosen <- fread(chosen_file)
 
-gw_cost_col <- paste0("gw_unit_cost_2019_usd_m3_", gw_scenario)
+gw_cost_col <- paste0(
+  "gw_unit_cost_2019_usd_m3_",
+  gw_scenario,
+  "_",
+  round(100 * discount_rate),
+  "pcdr"
+)
 gw_capacity_col <- paste0("gw_capacity_m3_year_", gw_scenario)
 
 groundwater <- fread(
@@ -88,6 +117,7 @@ required_options <- c(
   "source_id", "max_delivery_m3_year",
   "source_capacity_m3_year", "fixed_cost_2019usd_year",
   "variable_cost_2019usd_m3", "withdrawal_fraction",
+  "discount_rate",
   "capacity_flow_basis", "source_discharge_m3s"
 )
 required_city <- c(
@@ -112,6 +142,8 @@ stopifnot(
   all(city$status %in% c("covered", "uncovered")),
   all(is.finite(city$demand_m3_year) & city$demand_m3_year > 0),
   uniqueN(options$withdrawal_fraction) == 1L,
+  uniqueN(options$discount_rate) == 1L,
+  isTRUE(all.equal(unique(options$discount_rate), discount_rate)),
   abs(unique(options$withdrawal_fraction) - 0.30) < 1e-8,
   all(abs(city$withdrawal_fraction - 0.30) < 1e-8),
   uniqueN(options$capacity_flow_basis) == 1L,
@@ -673,7 +705,7 @@ stopifnot(
 fwrite(
   city_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("z_city_selected_portfolio_replacement_", scenario_tag, ".csv")
   )
 )
@@ -681,7 +713,7 @@ fwrite(
 fwrite(
   source_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("z_city_replacement_sources_", scenario_tag, ".csv")
   )
 )

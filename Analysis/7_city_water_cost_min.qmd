@@ -18,6 +18,8 @@ The capacity options use 30% of mean annual naturalized discharge. The chosen-so
 ```{r}
 #| label: load_inputs
 
+library(data.table)
+
 if (!requireNamespace("highs", quietly = TRUE)) {
   stop("Install the highs R package before running this file")
 }
@@ -34,7 +36,28 @@ solver_control <-
     presolve = "off"
   )
 
-analysis_dir <- here("Data/Analysis")
+analysis_dir_env <- Sys.getenv("MUNI_ANALYSIS_DIR", unset = "")
+analysis_dir <- if (nzchar(analysis_dir_env)) {
+  normalizePath(analysis_dir_env, mustWork = TRUE)
+} else {
+  here::here("Data", "Analysis")
+}
+
+processed_dir <- file.path(dirname(analysis_dir), "Processed")
+discount_rate <- suppressWarnings(as.numeric(
+  Sys.getenv("MUNI_DISCOUNT_RATE", unset = "0.02")
+))
+
+if (
+  length(discount_rate) != 1L ||
+  !is.finite(discount_rate) ||
+  !any(abs(discount_rate - c(0.01, 0.02, 0.03)) < 1e-10)
+) {
+  stop("MUNI_DISCOUNT_RATE must be 0.01, 0.02, or 0.03")
+}
+
+discount_tag <- sprintf("dr%02d", round(100 * discount_rate))
+scenario_dir <- file.path(analysis_dir, discount_tag)
 
 seconds_per_year <- 365.25 * 24 * 60 * 60
 
@@ -43,7 +66,7 @@ gw_scenario <- "0.3PD_0.25DL_0.2RR"
 sw_file <- 
   file.path(
     analysis_dir, 
-    "city_surface_water_capacity_options.csv"
+    paste0("city_surface_water_capacity_options_", discount_tag, ".csv")
   )
 
 conflict_file <- 
@@ -55,7 +78,7 @@ conflict_file <-
 gw_file <- 
   file.path(
     analysis_dir,
-    "ghsl_cities_gw_cost_compressed_20260921.csv"
+    "ghsl_cities_gw_cost_compressed_2pcdr_20261006.csv"
   )
 
 demand_file <- 
@@ -65,13 +88,15 @@ demand_file <-
   )
 
 candidate_metadata_file <- 
-  here(
-    "Data/Processed/1_surface_water_candidates_shortlist.rds"
+  file.path(
+    processed_dir,
+    "1_surface_water_candidates_shortlist.rds"
   )
 
 price_file <- 
-  here(
-    "Data/Processed/uc_2025_with_electricity_price.rds"
+  file.path(
+    processed_dir,
+    "uc_2025_with_electricity_price.rds"
   )
 
 input_files <- 
@@ -98,7 +123,7 @@ required_sw <-
     "demand_m3_year", "fixed_cost_2019usd_year",
     "variable_cost_2019usd_m3", "candidate_rank", "distance_km",
     "delta_z_m", "source_discharge_m3s", "source_lowflow_m3s",
-    "capacity_flow_basis", "withdrawal_fraction",
+    "capacity_flow_basis", "withdrawal_fraction", "discount_rate",
     "n_parallel_pipes", "pipe_diameter_m", "friction_head_m",
     "design_pumping_head_m", "annualized_capex_2019usd_year",
     "maintenance_cost_2019usd_year"
@@ -119,6 +144,8 @@ stopifnot(
   all(sw$fixed_cost_2019usd_year >= 0),
   all(sw$variable_cost_2019usd_m3 >= 0),
   uniqueN(sw$withdrawal_fraction) == 1L,
+  uniqueN(sw$discount_rate) == 1L,
+  isTRUE(all.equal(unique(sw$discount_rate), discount_rate)),
   uniqueN(sw$capacity_flow_basis) == 1L,
   unique(sw$capacity_flow_basis) ==
     "mean_annual_naturalized_discharge",
@@ -158,7 +185,13 @@ source_capacity_check <-
 stopifnot(all(source_capacity_check$n_capacities == 1L))
 rm(source_capacity_check)
 
-gw_cost_col <- paste0("gw_unit_cost_2019_usd_m3_", gw_scenario)
+gw_cost_col <- paste0(
+  "gw_unit_cost_2019_usd_m3_",
+  gw_scenario,
+  "_",
+  round(100 * discount_rate),
+  "pcdr"
+)
 gw_capacity_col <- paste0("gw_capacity_m3_year_", gw_scenario)
 
 gw <- 
@@ -708,14 +741,17 @@ stopifnot(
 
 ## 5. Save supply and cost results
 
-These supply results are saved with the `x_` prefix in `Data/Analysis`.
-Step 8 and 9 reads these two files.
+These supply results are saved with the `x_` prefix in the rate-specific
+`Data/Analysis/dr01`, `dr02`, or `dr03` folder. Steps 8 and 9 read these
+two files from the same folder.
 
 ```{r}
+dir.create(scenario_dir, recursive = TRUE, showWarnings = FALSE)
+
 fwrite(
   city_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("x_city_municipal_water_supply_", scenario_tag, ".csv")
   )
 )
@@ -723,7 +759,7 @@ fwrite(
 fwrite(
   source_results,
   file.path(
-    analysis_dir,
+    scenario_dir,
     paste0("x_city_surface_water_chosen_designs_", scenario_tag, ".csv")
   )
 )
@@ -736,5 +772,5 @@ print(city_results[, .(
   total_unmet_demand_m3_year = sum(unmet_demand_m3_year)
 ), by = status])
 
-cat("Saved city and chosen-source results in", analysis_dir, "\n")
+cat("Saved city and chosen-source results in", scenario_dir, "\n")
 ```
