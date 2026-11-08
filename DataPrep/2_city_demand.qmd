@@ -6,6 +6,11 @@ title: "Estimate demand for 2025 urban centers using 2019 country-level withdraw
 
 + Calculate the municipal water demand for each population center using AQUASTAT municipal water withdrawal per capita (total population) data.
 
+```{r}
+#| label: setup
+library(data.table)
+library(here)
+```
 
 ```{r}
 #/*--------------------------------*/

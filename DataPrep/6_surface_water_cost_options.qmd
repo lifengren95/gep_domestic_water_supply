@@ -22,6 +22,12 @@ competition between cities.
 ## 1. Set paths and assumptions
 
 ```{r}
+#| label: setup
+library(data.table)
+library(here)
+```
+
+```{r}
 candidate_file <- here(
     "Data/Processed/2_surface_water_candidates_with_elevation.rds"
   )

@@ -9,6 +9,11 @@ title: "Calculate the source-to-city elevation difference"
 - Elevation points from `5_1_elevation_updated.qmd`:
   `Data/Processed/FABDEM/elevation_points_complete.rds`
 
+```{r}
+#| label: setup
+library(data.table)
+library(here)
+```
 
 ```{r}
 #| label: load-inputs

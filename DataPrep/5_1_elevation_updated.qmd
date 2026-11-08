@@ -16,6 +16,12 @@ We need to get the (1) elevation for population centers `i` and (2) elevation fo
   + Its horizontal reference is WGS84 and vertical elevations are referenced to EGM2008.
   + It is much more suitable than a DSM for urban-centre centroids in particular.
 
+```{r}
+#| label: setup
+library(data.table)
+library(here)
+library(sf)
+```
 
 ```{r}
 uc_2025 <- 

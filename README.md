@@ -16,59 +16,45 @@ The analysis uses 2025 urban centres and population-weighted centroids from [GHS
 
 <br>
 
+## Project layout
 
-The scripts run in this order:
-
-1. `1_population_center.qmd` — prepare urban centres and their representative locations.
-2. `2_city_demand.qmd` — estimate city-level municipal water demand.
-3. `3_get_electricity_price.qmd` — assign 2019 electricity prices to cities.
-4. `4_1_identify_sw_source.qmd` — identify broad river, lake and reservoir candidates.
-5. `4_2_surface_water_shortlist.qmd` — shortlist candidates and record shared-flow conflicts.
-6. `5_1_elevation_updated.qmd` — extract and reuse elevations for cities and intake points.
-7. `5_2_elevation_difference.qmd` — calculate source-to-city elevation differences.
-8. `6_surface_water_cost_options.qmd` — calculate pipe-design capacities and fixed and variable surface-water costs.
-9. `7_city_water_cost_min.qmd` — find the baseline least-cost supply portfolio for each city.
-10. `8_selected_portfolio_replacement_cost.qmd` — calculate the main shared-flow-path replacement scenario.
-11. `9_selected_portfolio_replacement_cost.qmd` — calculate the selected-candidates-only sensitivity scenario. Both replacement scripts use the baseline outputs from `7_city_water_cost_min.qmd`.
-12. `10_country_municipal_replacement_cost.qmd` — aggregate the main scenario by country.
-
-The city-level baseline outputs are `Data/Analysis/x_city_municipal_water_supply_30.csv` and `Data/Analysis/x_city_surface_water_chosen_designs_30.csv`. The main replacement result is `Data/Analysis/y_city_shared_flowpath_replacement_30.csv`. The sensitivity result is `Data/Analysis/z_city_selected_portfolio_replacement_30.csv`. Country summaries are saved under `Data/Results/`. Country totals sum values only for cities with feasible baseline and replacement portfolios; the files also report coverage and reasons that other cities have no calculated value.
-
-
-## Folder Structures:
-
-To reproduce the municipal analysis, keep the scripts and input data in the following project structure. The QMD files use `here()` paths relative to the project root.
+Create a `WaterUse_municipal` folder and clone this repository into a subfolder named `Code`. Place the separate `Data` folder beside `Code`, not inside it. In RStudio, the simplest setup is to create and open an RStudio project in `WaterUse_municipal` (the `.Rproj` file in the diagram). Before running the analysis, check that `here::here()` prints the path to `WaterUse_municipal`; the code uses `here("Data", ...)` to find inputs and outputs.
 
 ```text
-.
-├── README.md
-├── 1_population_center.qmd
-├── 2_city_demand.qmd
-├── 3_get_electricity_price.qmd
-├── 4_1_identify_sw_source.qmd
-├── 4_2_surface_water_shortlist.qmd
-├── 5_1_elevation_updated.qmd
-├── 5_2_elevation_difference.qmd
-├── 6_surface_water_cost_options.qmd
-├── 7_city_water_cost_min.qmd
-├── 8_selected_portfolio_replacement_cost.qmd
-├── 9_selected_portfolio_replacement_cost.qmd
-├── 10_country_municipal_replacement_cost.qmd
-└── Data
-    ├── Raw
-    │   ├── GHS_WUP_MTUC_R2025A/
-    │   ├── RiverATLAS/RiverATLAS_v10.gdb/
-    │   ├── WDPA_Sep2026_Public/WDPA_Sep2026_Public.gdb/
-    │   ├── Boundary/z_ee_r250_correspondence.gpkg
-    │   └── boundary/z_ee_r250_correspondence.gpkg
-    ├── raw
-    │   ├── AQUASTAT/AQUASTAT_muni_withdrawal_per_capita.csv
-    │   └── LakeATLAS/LakeATLAS_v10.gdb/
-    ├── Processed
-    │   └── FABDEM/
-    ├── Analysis
-    │   └── ghsl_cities_gw_cost_compressed_20260921.csv
-    └── Results/
+WaterUse_municipal/
+├── WaterUse_municipal.Rproj    # create here if using RStudio
+├── Code/                       # clone this repository here
+│   ├── README.md
+│   ├── DataPrep/
+│   └── Analysis/
+└── Data/                       # input data and generated outputs
 ```
+
+The `.Rproj` file is a convenient way to set the working directory in RStudio; it is not required for `here()` itself. If `here::here()` prints the `Code` folder instead, the paths to `Data` will be wrong. Start the R session from `WaterUse_municipal` and check again.
+
+
+The scripts run in this order (script paths below are relative to `Code/`; `Data/` paths are relative to `WaterUse_municipal/`):
+
+1. `DataPrep/1_population_center.qmd` — prepare urban centres and their representative locations.
+2. `DataPrep/2_city_demand.qmd` — estimate city-level municipal water demand.
+3. `DataPrep/3_get_electricity_price.qmd` — assign 2019 electricity prices to cities.
+4. `DataPrep/4_1_identify_sw_source.qmd` — identify broad river, lake and reservoir candidates.
+5. `DataPrep/4_2_surface_water_shortlist.qmd` — shortlist candidates and record shared-flow conflicts.
+6. `DataPrep/5_1_elevation_updated.qmd` — extract and reuse elevations for cities and intake points.
+7. `DataPrep/5_2_elevation_difference.qmd` — calculate source-to-city elevation differences.
+8. `DataPrep/6_surface_water_cost_options.qmd` — calculate pipe-design capacities and fixed and variable surface-water costs. One run writes `Data/Analysis/city_surface_water_capacity_options_dr01.csv`, `_dr02.csv`, and `_dr03.csv` for 1%, 2%, and 3% discount rates.
+9. `Analysis/run_discount_scenarios.R` — run `Analysis/7_city_water_cost_min.qmd`, `Analysis/8_selected_portfolio_replacement_cost.qmd`, and `Analysis/9_selected_portfolio_replacement_cost.qmd` in that order for each of the three discount rates. Step 7 finds the baseline least-cost supply portfolio; step 8 calculates the main shared-flow-path replacement scenario; step 9 calculates the selected-candidates-only sensitivity scenario. Both replacement scripts use the baseline outputs from step 7.
+10. `Analysis/10_country_municipal_replacement_cost.qmd` — aggregate the main replacement results by country for all three rates. The 2% (`dr02`) case is the main result.
+
+After completing steps 1–8, run the remaining steps from `WaterUse_municipal/` with R and Quarto installed and `quarto` on your `PATH`:
+
+```sh
+Rscript Code/Analysis/run_discount_scenarios.R
+quarto render Code/Analysis/10_country_municipal_replacement_cost.qmd
+```
+
+The R runner checks that the three step 6 cost-option files exist before rendering steps 7–9. It writes rate-specific outputs to `Data/Analysis/dr01/`, `dr02/`, and `dr03/`; rendered Quarto reports go into a `quarto_output/` subfolder of each. The city-level baseline outputs are `x_city_municipal_water_supply_30.csv` and `x_city_surface_water_chosen_designs_30.csv`. The main replacement result is `y_city_shared_flowpath_replacement_30.csv`, and the sensitivity result is `z_city_selected_portfolio_replacement_30.csv`. Country summaries are saved under `Data/Results/dr01/`, `dr02/`, and `dr03/`. Country totals sum values only for cities with feasible baseline and replacement portfolios; the files also report coverage and reasons that other cities have no calculated value.
+
+## Data and path notes
 
 The scripts also obtain World Bank electricity-price data and FABDEM elevation tiles. The current files refer to both `Data/Raw` and `Data/raw`, and to both `Boundary` and `boundary`. Check these path spellings when running on a case-sensitive filesystem.

@@ -22,6 +22,14 @@ $$
 
 where $\mathrm{lon}_i^{PW}$ and $\mathrm{lat}_i^{PW}$ denote the longitude and latitude of the population-weighted centroid, respectively. This location is used as the representative municipal water-demand point in the subsequent analysis of surface-water access and conveyance costs.
 
+```{r}
+#| label: setup
+library(data.table)
+library(here)
+library(sf)
+library(ggplot2)
+library(magrittr)
+```
 
 ```{r}
 

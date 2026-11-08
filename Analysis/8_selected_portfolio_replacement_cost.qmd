@@ -14,8 +14,12 @@ The difference between the two annual costs measures the modeled cost of losing 
 ## 1. Read the current 30% scenario and the saved step 7 solution
 
 ```{r}
+#| label: setup
 library(data.table)
 library(here)
+```
+
+```{r}
 
 if (!requireNamespace("highs", quietly = TRUE)) {
   stop("Install the highs R package before running this file")

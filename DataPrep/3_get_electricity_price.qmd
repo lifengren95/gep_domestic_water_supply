@@ -2,10 +2,15 @@
 title: "Get energy cost from World Bank"
 ---
 
-
 ```{r}
+#| label: setup
+library(data.table)
+library(here)
 library(countrycode)
 library(jsonlite)
+```
+
+```{r}
 
 # /*===========================================*/
 #'=  1. Download World Bank electricity price =

@@ -14,6 +14,10 @@ The city output also reports whether the electricity price used by step 6 is pre
 The capacity options use 30% of mean annual naturalized discharge. The chosen-source output retains the lake type, area, total volume, and reservoir volume from the shortlist for auditing. These descriptors do not increase annual withdrawal capacity in this model.
 
 ## 1. Load and check inputs
+```{r}
+#| label: setup
+library(data.table)
+```
 
 ```{r}
 #| label: load_inputs

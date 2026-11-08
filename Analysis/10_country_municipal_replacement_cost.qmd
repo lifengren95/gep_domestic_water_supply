@@ -10,6 +10,14 @@ This script aggregates the **shared-flow-path** replacement results from step 8 
 ## 1. Read the city results and country identifiers
 
 ```{r}
+#| label: setup
+library(data.table)
+library(here)
+library(sf)
+library(magrittr)
+```
+
+```{r}
 
 analysis_dir <- here("Data/Analysis")
 result_dir <- here("Data/Results")
@@ -422,6 +430,8 @@ final_gep_report_detailed <-
       wateruse_municipal_gep = replacement_value_2019usd_year,
       missing_value_reason
     )
+  ][
+    order(iso3_r250_id)
   ]
 
 fwrite(

@@ -8,6 +8,7 @@ Download the polygon layer of the World Database on Protected Areas from [Protec
 
 River reaches must have at least 0.5 m3/s modeled mean annual naturalized flow. The lowest-month flow is retained as an attribute, but it does not exclude reaches from this broad candidate file. Step 4_2 uses both mean annual and lowest-month flow to select complementary river shortlists.  Step 5 calculates source capacity from mean annual flow.  LakeATLAS starts at about 0.1 km2. There is no additional lake-size cutoff in this baseline because we have not checked how a larger threshold would affect known municipal sources. Lake candidates are diversified across nearby sources, high average outlet flow, large area, and reservoir volume. `Vol_res` is a storage descriptor; it is not annual supply.
 
+
 ```{r}
 #| label: setup
 
